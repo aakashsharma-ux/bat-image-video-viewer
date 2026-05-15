@@ -21,7 +21,7 @@ A Batman-themed image gallery viewer. Paste up to 1,000 image URLs, view them in
 
 ---
 
-## File Structure
+## File Structure:
 
 ```
 bat-viewer/
