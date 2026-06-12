@@ -82,31 +82,54 @@
     function downloadImage(url) {
       /* Derive a sensible filename from the URL path.
          Strip query-string and fragment; fall back to 'image' if the
-         path segment has no recognisable extension. */
+         path segment carries no recognisable file extension. */
       var raw  = url.split('/').pop().split(/[?#]/)[0];
       var name = raw.match(/\.[a-zA-Z0-9]{2,5}$/) ? raw : 'image';
-      /* Try fetch-as-blob first (works when the server sends permissive
-         CORS headers).  On failure — CORS block, network error, non-2xx
-         — open in a new tab as a graceful fallback so the user can still
-         save the image via the browser's native Save-As. */
-      return fetch(url, { mode: 'cors', credentials: 'omit' })
-        .then(function (res) {
-          if (!res.ok) throw new Error('HTTP ' + res.status);
-          return res.blob();
+
+      function triggerBlobDownload(blob) {
+        var blobUrl = URL.createObjectURL(blob);
+        var a = document.createElement('a');
+        a.href = blobUrl;
+        a.download = name;
+        a.style.display = 'none';
+        document.body.appendChild(a);
+        a.click();
+        setTimeout(function () {
+          document.body.removeChild(a);
+          URL.revokeObjectURL(blobUrl);
+        }, 3000);
+      }
+
+      function safeFetch(fetchUrl) {
+        return fetch(fetchUrl, { credentials: 'omit' })
+          .then(function (res) {
+            if (!res.ok) throw new Error('HTTP ' + res.status);
+            return res.blob();
+          });
+      }
+
+      /* Stage 1 — direct fetch.
+         Works for same-origin URLs and any host that sends permissive
+         CORS headers (e.g. most CDNs, Wikimedia, Unsplash).
+
+         Stage 2 — CORS proxy fallback.
+         Cross-origin hosts such as Reddit or NYT do not send CORS
+         headers, so a browser-side fetch is blocked by the browser's
+         security policy.  We retry through corsproxy.io, which fetches
+         the image server-side and relays it with permissive CORS headers.
+         The target URL is fully encoded as a query parameter so that any
+         query strings in the original URL are preserved intact. */
+      return safeFetch(url)
+        .catch(function () {
+          return safeFetch(
+            'https://corsproxy.io/?url=' + encodeURIComponent(url)
+          );
         })
         .then(function (blob) {
-          var blobUrl = URL.createObjectURL(blob);
-          var a = document.createElement('a');
-          a.href = blobUrl;
-          a.download = name;
-          a.style.display = 'none';
-          document.body.appendChild(a);
-          a.click();
-          setTimeout(function () {
-            document.body.removeChild(a);
-            URL.revokeObjectURL(blobUrl);
-          }, 3000);
+          triggerBlobDownload(blob);
         });
+      /* Any remaining rejection propagates to the button's .catch handler
+         which shows a user-visible error state — never a silent new tab. */
     }
     return {
       $: $, el: el, on: on, stop: stop, isTyping: isTyping,
@@ -507,16 +530,18 @@
               }, 2000);
             })
             .catch(function () {
-              /* CORS blocked or network error — open in new tab as fallback
-                 so the user can save via browser's native Save-As. */
-              window.open(opts.url, '_blank');
-              dlBtn.textContent = 'Opened \u2197';
+              /* Both direct fetch and the CORS proxy failed (e.g. the
+                 host blocks all external access, or the user is offline).
+                 Show a clear error state — never silently open a new tab. */
+              dlBtn.textContent = 'Failed \u2715';
               dlBtn.classList.remove('loading');
+              dlBtn.classList.add('err');
               dlBtn.disabled = false;
               clearTimeout(dlTid);
               dlTid = setTimeout(function () {
                 dlBtn.textContent = 'Download';
-              }, 2400);
+                dlBtn.classList.remove('err');
+              }, 3000);
             });
         });
       }

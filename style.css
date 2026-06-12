@@ -546,6 +546,7 @@ body.edit-active .card:not(.editing) {
 }
 .tdownload:hover   { background: rgba(0,188,212,0.16); }
 .tdownload.ok      { background: rgba(46,204,113,0.08); color: var(--green); border-color: rgba(46,204,113,0.22); }
+.tdownload.err     { background: rgba(231,76,60,0.10); color: #e74c3c; border-color: rgba(231,76,60,0.28); }
 .tdownload.loading { opacity: 0.6; cursor: wait; }
 [data-theme="moon"] .tdownload { color: #008fa3; border-color: rgba(0,143,163,0.30); }
 
