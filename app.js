@@ -79,9 +79,39 @@
       }
       return fallbackCopy(text);
     }
+    function downloadImage(url) {
+      /* Derive a sensible filename from the URL path.
+         Strip query-string and fragment; fall back to 'image' if the
+         path segment has no recognisable extension. */
+      var raw  = url.split('/').pop().split(/[?#]/)[0];
+      var name = raw.match(/\.[a-zA-Z0-9]{2,5}$/) ? raw : 'image';
+      /* Try fetch-as-blob first (works when the server sends permissive
+         CORS headers).  On failure — CORS block, network error, non-2xx
+         — open in a new tab as a graceful fallback so the user can still
+         save the image via the browser's native Save-As. */
+      return fetch(url, { mode: 'cors', credentials: 'omit' })
+        .then(function (res) {
+          if (!res.ok) throw new Error('HTTP ' + res.status);
+          return res.blob();
+        })
+        .then(function (blob) {
+          var blobUrl = URL.createObjectURL(blob);
+          var a = document.createElement('a');
+          a.href = blobUrl;
+          a.download = name;
+          a.style.display = 'none';
+          document.body.appendChild(a);
+          a.click();
+          setTimeout(function () {
+            document.body.removeChild(a);
+            URL.revokeObjectURL(blobUrl);
+          }, 3000);
+        });
+    }
     return {
       $: $, el: el, on: on, stop: stop, isTyping: isTyping,
-      clamp: clamp, fmtTime: fmtTime, copyToClipboard: copyToClipboard
+      clamp: clamp, fmtTime: fmtTime, copyToClipboard: copyToClipboard,
+      downloadImage: downloadImage
     };
   })();
 
@@ -453,6 +483,44 @@
         });
       });
 
+      /* ── Download button (image cards only, opt-in via showDownload) ── */
+      var dlBtn = null;
+      if (opts.showDownload) {
+        dlBtn = makeBtn('tdownload', 'Download');
+        var dlTid = null;
+        on(dlBtn, 'click', function (ev) {
+          ev && ev.stopPropagation && ev.stopPropagation();
+          if (dlBtn.disabled) return;
+          dlBtn.textContent = 'Saving\u2026';
+          dlBtn.classList.add('loading');
+          dlBtn.disabled = true;
+          Util.downloadImage(opts.url)
+            .then(function () {
+              dlBtn.textContent = 'Saved!';
+              dlBtn.classList.remove('loading');
+              dlBtn.classList.add('ok');
+              dlBtn.disabled = false;
+              clearTimeout(dlTid);
+              dlTid = setTimeout(function () {
+                dlBtn.textContent = 'Download';
+                dlBtn.classList.remove('ok');
+              }, 2000);
+            })
+            .catch(function () {
+              /* CORS blocked or network error — open in new tab as fallback
+                 so the user can save via browser's native Save-As. */
+              window.open(opts.url, '_blank');
+              dlBtn.textContent = 'Opened \u2197';
+              dlBtn.classList.remove('loading');
+              dlBtn.disabled = false;
+              clearTimeout(dlTid);
+              dlTid = setTimeout(function () {
+                dlBtn.textContent = 'Download';
+              }, 2400);
+            });
+        });
+      }
+
       var editBtn = makeBtn('tedit', 'Edit');
       on(editBtn, 'click', function () { opts.onEdit && opts.onEdit(editBtn); });
 
@@ -460,6 +528,7 @@
       on(removeBtn, 'click', function () { opts.onRemove && opts.onRemove(); });
 
       bar.appendChild(copyBtn);
+      if (dlBtn) bar.appendChild(dlBtn);
       bar.appendChild(editBtn);
       bar.appendChild(removeBtn);
       return bar;
@@ -780,6 +849,7 @@
       card.appendChild(Chrome.urlRow(url));
       card.appendChild(Chrome.toolbar({
         url: url,
+        showDownload: true,
         onEdit: function () {
           if (card.classList.contains('editing')) {
             EditMode.exit(false);
