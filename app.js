@@ -80,56 +80,84 @@
       return fallbackCopy(text);
     }
     function downloadImage(url) {
-      /* Derive a sensible filename from the URL path.
-         Strip query-string and fragment; fall back to 'image' if the
-         path segment carries no recognisable file extension. */
-      var raw  = url.split('/').pop().split(/[?#]/)[0];
-      var name = raw.match(/\.[a-zA-Z0-9]{2,5}$/) ? raw : 'image';
+      /* ── Filename extraction ──────────────────────────────────────
+         Strip query-string and fragment from the last path segment.
+         name stays null when no extension is found so we can fill it
+         in from the blob's Content-Type after a successful fetch.      */
+      var raw    = url.split('/').pop().split(/[?#]/)[0];
+      var hasExt = /\.[a-zA-Z0-9]{2,5}$/.test(raw);
+      var name   = hasExt ? raw : null;
 
+      /* ── Blob → file download ────────────────────────────────── */
       function triggerBlobDownload(blob) {
+        var filename = name;
+        if (!filename) {
+          /* Derive extension from Content-Type (e.g. image/jpeg → .jpg) */
+          var mime = (blob.type || 'image/jpeg').split(';')[0].trim();
+          var sub  = mime.split('/')[1] || 'jpg';
+          sub = sub === 'jpeg' ? 'jpg' : sub;
+          filename = 'image.' + sub;
+        }
         var blobUrl = URL.createObjectURL(blob);
         var a = document.createElement('a');
-        a.href = blobUrl;
-        a.download = name;
+        a.href     = blobUrl;
+        a.download = filename;
         a.style.display = 'none';
         document.body.appendChild(a);
         a.click();
         setTimeout(function () {
           document.body.removeChild(a);
           URL.revokeObjectURL(blobUrl);
-        }, 3000);
+        }, 5000);
       }
 
+      /* ── Single fetch with 15-second timeout ────────────────────
+         Uses Promise.race so a stalled server doesn't block the
+         fallback chain indefinitely.                                  */
       function safeFetch(fetchUrl) {
-        return fetch(fetchUrl, { credentials: 'omit' })
+        var timeout = new Promise(function (_, reject) {
+          setTimeout(function () { reject(new Error('timeout')); }, 15000);
+        });
+        var request = fetch(fetchUrl, { credentials: 'omit' })
           .then(function (res) {
             if (!res.ok) throw new Error('HTTP ' + res.status);
             return res.blob();
           });
+        return Promise.race([request, timeout]);
       }
 
-      /* Stage 1 — direct fetch.
-         Works for same-origin URLs and any host that sends permissive
-         CORS headers (e.g. most CDNs, Wikimedia, Unsplash).
+      /* ── Proxy cascade ───────────────────────────────────────────
+         Stage 1 — Direct fetch.
+           Works for same-origin URLs and any host that includes
+           permissive CORS headers (most CDNs, Wikimedia, Imgur, etc.)
 
-         Stage 2 — CORS proxy fallback.
-         Cross-origin hosts such as Reddit or NYT do not send CORS
-         headers, so a browser-side fetch is blocked by the browser's
-         security policy.  We retry through corsproxy.io, which fetches
-         the image server-side and relays it with permissive CORS headers.
-         The target URL is fully encoded as a query parameter so that any
-         query strings in the original URL are preserved intact. */
-      return safeFetch(url)
-        .catch(function () {
-          return safeFetch(
-            'https://corsproxy.io/?url=' + encodeURIComponent(url)
-          );
-        })
-        .then(function (blob) {
-          triggerBlobDownload(blob);
-        });
-      /* Any remaining rejection propagates to the button's .catch handler
-         which shows a user-visible error state — never a silent new tab. */
+         Stage 2 — corsproxy.io (current API — bare encoded URL as
+           the entire query string, no "url=" key).
+
+         Stage 3 — allorigins.win /raw endpoint.
+           Returns the raw bytes with CORS headers; independent of
+           corsproxy.io so a failure on one doesn't affect the other.
+
+         Stage 4 — corsproxy.io legacy format (?url=…).
+           Some older deployments still route this format; including it
+           as a final attempt costs nothing if stages 2/3 already pass. */
+      var proxies = [
+        function () { return safeFetch(url); },
+        function () { return safeFetch('https://corsproxy.io/?' + encodeURIComponent(url)); },
+        function () { return safeFetch('https://api.allorigins.win/raw?url=' + encodeURIComponent(url)); },
+        function () { return safeFetch('https://corsproxy.io/?url=' + encodeURIComponent(url)); }
+      ];
+
+      function tryNext(i) {
+        if (i >= proxies.length) {
+          return Promise.reject(new Error('All download methods failed'));
+        }
+        return proxies[i]().catch(function () { return tryNext(i + 1); });
+      }
+
+      return tryNext(0).then(triggerBlobDownload);
+      /* Remaining rejection propagates to the button's .catch handler
+         which shows "Failed ✕" — never a silent new-tab fallback.      */
     }
     return {
       $: $, el: el, on: on, stop: stop, isTyping: isTyping,
