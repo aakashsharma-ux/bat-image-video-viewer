@@ -111,12 +111,13 @@
         }, 5000);
       }
 
-      /* ── Single fetch with 15-second timeout ────────────────────
-         Uses Promise.race so a stalled server doesn't block the
-         fallback chain indefinitely.                                  */
-      function safeFetch(fetchUrl) {
+      /* ── Single fetch with configurable timeout ─────────────────
+         ms defaults to 10 000.  CORS failures are instant (the browser
+         rejects them before any network round-trip) so the timeout only
+         matters for genuinely slow or hung upstream servers.            */
+      function safeFetch(fetchUrl, ms) {
         var timeout = new Promise(function (_, reject) {
-          setTimeout(function () { reject(new Error('timeout')); }, 15000);
+          setTimeout(function () { reject(new Error('timeout')); }, ms || 10000);
         });
         var request = fetch(fetchUrl, { credentials: 'omit' })
           .then(function (res) {
@@ -127,25 +128,36 @@
       }
 
       /* ── Proxy cascade ───────────────────────────────────────────
-         Stage 1 — Direct fetch.
-           Works for same-origin URLs and any host that includes
-           permissive CORS headers (most CDNs, Wikimedia, Imgur, etc.)
+         Stage 1 — Direct fetch (8 s).
+           Works for same-origin URLs and any host that sends permissive
+           CORS headers: most CDNs, Imgur, Wikimedia, GitHub raw, etc.
+           CORS failures are synchronous browser rejections — fast.
 
-         Stage 2 — corsproxy.io (current API — bare encoded URL as
-           the entire query string, no "url=" key).
+         Stage 2 — BAT-Viewer backend proxy /api/proxy-download (8 s).
+           The Node.js server fetches the image server-side with real
+           browser headers, bypassing all browser CORS restrictions and
+           CDN IP-blocking.  This is the most reliable path for hosts
+           like NYT / Reddit that actively block public proxy services.
+           Falls through quickly (connection refused) when the backend
+           is not running (e.g. opening index.html directly).
 
-         Stage 3 — allorigins.win /raw endpoint.
-           Returns the raw bytes with CORS headers; independent of
-           corsproxy.io so a failure on one doesn't affect the other.
+         Stage 3 — images.weserv.nl (12 s).
+           A long-running dedicated image-proxy CDN that re-serves images
+           with permissive CORS headers.  Works for many hosts that block
+           generic proxy services.
 
-         Stage 4 — corsproxy.io legacy format (?url=…).
-           Some older deployments still route this format; including it
-           as a final attempt costs nothing if stages 2/3 already pass. */
+         Stage 4 — corsproxy.io current API (12 s).
+           Bare encoded URL as the entire query string (no "url=" key).
+
+         Stage 5 — allorigins.win /raw (12 s).
+           Independent service; failure on one proxy does not affect it.  */
+      var enc = encodeURIComponent(url);
       var proxies = [
-        function () { return safeFetch(url); },
-        function () { return safeFetch('https://corsproxy.io/?' + encodeURIComponent(url)); },
-        function () { return safeFetch('https://api.allorigins.win/raw?url=' + encodeURIComponent(url)); },
-        function () { return safeFetch('https://corsproxy.io/?url=' + encodeURIComponent(url)); }
+        function () { return safeFetch(url, 8000); },
+        function () { return safeFetch('/api/proxy-download?url=' + enc, 8000); },
+        function () { return safeFetch('https://images.weserv.nl/?url=' + enc, 12000); },
+        function () { return safeFetch('https://corsproxy.io/?' + enc, 12000); },
+        function () { return safeFetch('https://api.allorigins.win/raw?url=' + enc, 12000); }
       ];
 
       function tryNext(i) {
