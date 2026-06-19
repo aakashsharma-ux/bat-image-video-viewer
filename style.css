@@ -390,6 +390,16 @@ kbd {
   transition: background 0.35s ease;
 }
 
+/* Progressive-load sentinel — invisible 1-row spacer at gallery end.
+   grid-column: 1/-1 stretches across all columns so it never takes
+   a grid cell away from a real slot.                                  */
+.pl-sentinel {
+  grid-column: 1 / -1;
+  height: 1px;
+  pointer-events: none;
+  visibility: hidden;
+}
+
 .url-label {
   display: block; font-size: 1px; line-height: 1px;
   color: transparent; overflow: hidden;

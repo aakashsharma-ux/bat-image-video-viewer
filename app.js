@@ -204,8 +204,9 @@
     sizeBadge    : $('sizeBadge'),
     scrollSpeed  : $('scrollSpeed'),
     scrollBadge  : $('scrollBadge'),
-    zoomEnabled  : $('zoomEnabled'),
-    themeToggle  : $('themeToggle'),
+    zoomEnabled           : $('zoomEnabled'),
+    fastImageProcessing   : $('fastImageProcessing'),
+    themeToggle           : $('themeToggle'),
     themeLabel   : $('themeLabel'),
     helpBtn      : $('helpBtn'),
     helpTooltip  : $('helpTooltip'),
@@ -724,6 +725,97 @@
       makeSlot: makeSlot, rebuildObserver: rebuildObserver,
       clear: clear, appendUrls: appendUrls
     };
+  })();
+
+  /* ════════════════════════════════════════════════════════
+     PROGRESSIVE LOAD
+
+     When the "Fast Image Processing" toggle is on, only the
+     first 100 slots are placed into the DOM on load.  A thin
+     sentinel <div> is appended after them.  An IntersectionObserver
+     watches the sentinel; as soon as it enters the viewport
+     (with a 400 px look-ahead margin) the next 100 URLs are
+     handed to Virtual.appendUrls, then the sentinel is moved
+     back to the bottom — repeat until the queue is empty.
+
+     All previously loaded slots stay in the DOM and in memory;
+     nothing is unloaded.  The existing Virtual observer keeps
+     handling lazy content-activation as usual.
+  ════════════════════════════════════════════════════════ */
+  var ProgressiveLoad = (function () {
+    var BATCH     = 100;
+    var _pending  = [];    /* URLs not yet rendered */
+    var _sentinel = null;  /* trigger element anchored at gallery end */
+    var _sentObs  = null;  /* dedicated observer for the sentinel */
+    var _busy     = false; /* guard: prevent double-fire on one frame */
+
+    function _removeSentinel() {
+      if (_sentObs)  { _sentObs.disconnect();  _sentObs  = null; }
+      if (_sentinel) { _sentinel.remove();     _sentinel = null; }
+    }
+
+    function _loadBatch() {
+      /* Double-fire guard and empty-queue check */
+      if (_busy) return;
+      if (!_pending.length) { _removeSentinel(); return; }
+
+      _busy = true;
+
+      var batch  = _pending.slice(0, BATCH);
+      _pending   = _pending.slice(BATCH);
+
+      /* appendUrls adds batch to State.allUrls, builds slots,
+         appends them to DOM.gallery (currently after sentinel),
+         and observes each new slot with the Virtual observer. */
+      Virtual.appendUrls(batch);
+
+      /* Move sentinel back to the very end so it stays below
+         the freshly added slots and triggers the next batch. */
+      if (_sentinel && _sentinel.parentNode) {
+        DOM.gallery.appendChild(_sentinel);
+      }
+
+      /* No more URLs — tear down */
+      if (!_pending.length) _removeSentinel();
+
+      _busy = false;
+    }
+
+    function _makeSentinel() {
+      _sentinel = document.createElement('div');
+      _sentinel.className  = 'pl-sentinel';
+      _sentinel.setAttribute('aria-hidden', 'true');
+      DOM.gallery.appendChild(_sentinel);
+
+      _sentObs = new IntersectionObserver(function (entries) {
+        entries.forEach(function (e) { if (e.isIntersecting) _loadBatch(); });
+      }, { root: null, rootMargin: '400px 0px', threshold: 0 });
+
+      _sentObs.observe(_sentinel);
+    }
+
+    /* Public: kick off a progressive session with the full URL list. */
+    function start(urls) {
+      _removeSentinel();
+      _busy    = false;
+      var first = urls.slice(0, BATCH);
+      _pending  = urls.slice(BATCH);
+      Virtual.appendUrls(first);            /* renders first 100 slots  */
+      if (_pending.length) _makeSentinel(); /* arms the scroll trigger   */
+    }
+
+    /* Public: discard pending queue and remove the sentinel. */
+    function clear() {
+      _removeSentinel();
+      _pending = [];
+      _busy    = false;
+    }
+
+    function isEnabled() {
+      return !!(DOM.fastImageProcessing && DOM.fastImageProcessing.checked);
+    }
+
+    return { start: start, clear: clear, isEnabled: isEnabled };
   })();
 
   /* ════════════════════════════════════════════════════════
@@ -1498,8 +1590,39 @@
     State.isLoading = true;
     DOM.bulkLoadBtn.disabled = true;
 
-    if (!DOM.appendMode.checked) Virtual.clear();
+    if (!DOM.appendMode.checked) {
+      ProgressiveLoad.clear();
+      Virtual.clear();
+    }
 
+    /* ── PROGRESSIVE MODE ────────────────────────────────────────────
+       Render only the first 100 slots immediately; the rest are held
+       in the ProgressiveLoad queue and flushed 100 at a time via the
+       sentinel IntersectionObserver as the user scrolls.              */
+    if (ProgressiveLoad.isEnabled()) {
+      var firstN = Math.min(100, urls.length);
+
+      DOM.progWrap.classList.remove('hide');
+      DOM.progFill.style.width = String(Math.round((firstN / urls.length) * 100)) + '%';
+      DOM.progLabel.textContent = 'Queued ' + urls.length + ' items. Loading first ' + firstN + '\u2026';
+      await new Promise(function (r) { requestAnimationFrame(r); });
+
+      ProgressiveLoad.start(urls);
+
+      var pSummary = firstN + ' of ' + urls.length +
+                     ' item' + (urls.length !== 1 ? 's' : '') + ' loaded' +
+                     (urls.length > firstN ? ' \u2014 scroll down to load more.' : '.');
+      DOM.progLabel.textContent = firstN + ' / ' + urls.length + ' items ready!';
+      Toast.show(pSummary, 'ok', 4000);
+      setTimeout(function () { DOM.progWrap.classList.add('hide'); DOM.progFill.style.width = '0%'; }, 2400);
+      DOM.bulkArea.value = '';
+      DOM.bulkTally.innerHTML = '<b>0</b> URLs';
+      State.isLoading = false;
+      DOM.bulkLoadBtn.disabled = false;
+      return;
+    }
+
+    /* ── STANDARD MODE (unchanged) ───────────────────────────────── */
     var startIdx = State.allUrls.length;
     State.allUrls = State.allUrls.concat(urls);
 
@@ -1546,7 +1669,10 @@
     DOM.bulkTally.innerHTML = '<b>0</b> URLs';
   });
 
-  on(DOM.clearAllBtn, 'click', Virtual.clear);
+  on(DOM.clearAllBtn, 'click', function () {
+    ProgressiveLoad.clear();
+    Virtual.clear();
+  });
 
   /* ════════════════════════════════════════════════════════
      GLOBAL VIDEO CONTROLS  (Pause All / Mute All / Speed All)
