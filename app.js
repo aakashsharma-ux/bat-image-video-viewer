@@ -1105,11 +1105,6 @@
         rotateWrap.style.transform = 'rotate(' + storedEdit.rotation + 'deg)';
       }
 
-      /* Big centred play overlay */
-      var playOverlay = el('div', 'video-play-overlay',
-        '<div class="video-play-icon">\u25B6</div>');
-      box.appendChild(playOverlay);
-
       /* Zoom badge + hint — same overlay elements as ImageCard */
       var badge = el('div', 'zoom-badge');
       var hint  = el('div', 'zoom-hint');

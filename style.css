@@ -869,26 +869,6 @@ body.edit-active #btt { right: 298px; }
   overflow: hidden;             /* clip the overlay controls */
 }
 
-/* ── Big centre Play affordance (visible when paused) ─────── */
-.video-play-overlay {
-  position: absolute; inset: 0;
-  display: flex; align-items: center; justify-content: center;
-  pointer-events: none;
-  background: radial-gradient(circle at center, rgba(0,0,0,0.18) 0%, rgba(0,0,0,0) 70%);
-  transition: opacity 0.18s;
-  z-index: 4;
-}
-.card-video-box.playing .video-play-overlay { opacity: 0; }
-.video-play-icon {
-  width: 64px; height: 64px;
-  border-radius: 50%;
-  background: rgba(0,0,0,0.55);
-  border: 2px solid var(--gold);
-  color: var(--gold);
-  display: flex; align-items: center; justify-content: center;
-  font-size: 26px; padding-left: 6px;
-  box-shadow: 0 4px 18px rgba(0,0,0,0.45);
-}
 
 /* ── Thin progress strip — overlays video, auto-hides with controls ── */
 .video-progress-line {
