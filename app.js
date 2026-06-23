@@ -235,6 +235,7 @@
     editStates : Object.create(null),
     videoStates: Object.create(null),
     videoOverrides: new Set(), /* URLs confirmed as video via probe fallback */
+    imageOverrides: new Set(), /* URLs confirmed as image via fallback */
     spaceHeld  : false,
     hoveredBox : null,
     hoveredVideoCard: null,
@@ -341,9 +342,25 @@
      URL PARSE / VALIDATE / MEDIA TYPE
   ════════════════════════════════════════════════════════ */
   var VIDEO_EXT_RE = /\.(mp4|webm|mkv|mov|avi|m4v|ogv|ogg|ts|mpe?g|3gp|flv|m3u8)(?:$|[?#])/i;
+  var IMAGE_EXT_RE = /\.(jpe?g|png|gif|webp|svg|bmp|ico|tiff?|avif|heic|heif)(?:$|[?#])/i;
+
   function getMediaType(url) {
+    if (!url) return 'image';
     if (State.videoOverrides.has(url)) return 'video';
-    return url && VIDEO_EXT_RE.test(url) ? 'video' : 'image';
+    if (State.imageOverrides.has(url)) return 'image';
+
+    if (VIDEO_EXT_RE.test(url)) return 'video';
+    if (IMAGE_EXT_RE.test(url)) return 'image';
+
+    var lower = url.toLowerCase();
+    if (lower.indexOf('video') !== -1 || lower.indexOf('mp4') !== -1 || lower.indexOf('webm') !== -1 || lower.indexOf('mkv') !== -1 || lower.indexOf('mov') !== -1) {
+      return 'video';
+    }
+    if (lower.indexOf('image') !== -1 || lower.indexOf('jpg') !== -1 || lower.indexOf('jpeg') !== -1 || lower.indexOf('png') !== -1 || lower.indexOf('gif') !== -1 || lower.indexOf('webp') !== -1) {
+      return 'image';
+    }
+
+    return 'video';
   }
 
   function parseUrls(txt) {
@@ -685,7 +702,7 @@
     }
     function rebuildObserver() {
       if (State.observer) State.observer.disconnect();
-      /* Keep only ~1 screen of cards hot above/below the viewport so we
+      /* Keep only ~0.5 screen of cards hot above/below the viewport so we
          scale to 1,000+ media items without exhausting memory or sockets.
          Inactive slots fully unload their <video src> in deactivate(). */
       State.observer = new IntersectionObserver(function (entries) {
@@ -693,7 +710,7 @@
           if (e.isIntersecting) activate(e.target);
           else                  deactivate(e.target);
         });
-      }, { root: null, rootMargin: '100% 0px 100% 0px', threshold: 0 });
+      }, { root: null, rootMargin: '50% 0px 50% 0px', threshold: 0 });
       State.slots.forEach(function (s) { State.observer.observe(s); });
     }
     function clear() {
@@ -708,6 +725,7 @@
       DOM.gallery.innerHTML = '';
       State.allUrls = []; State.slots = []; State.activeSet = new Set();
       State.videoOverrides.clear();
+      State.imageOverrides.clear();
       VideoState.clear();
       refreshCount();
     }
@@ -987,42 +1005,23 @@
         zoom.syncCursor();
       });
       on(img, 'error', function () {
-        /* The URL may actually be a video (signed URL, CDN, no extension).
-           Probe with a hidden <video> before giving up. */
-        var probe = document.createElement('video');
-        probe.preload = 'metadata';
-        probe.muted = true;
-        var probeTimer = setTimeout(function () {
-          /* Timed out — show error */
-          try { probe.removeAttribute('src'); probe.load(); } catch (_) {}
-          spin.remove();
-          box.innerHTML = '<div class="card-err">\u26a0 Could not load<br>' +
-                          '<small style="opacity:.4;word-break:break-all;">' + url + '</small></div>';
-        }, 10000);
-        on(probe, 'loadeddata', function () {
-          clearTimeout(probeTimer);
-          try { probe.pause(); probe.removeAttribute('src'); probe.load(); } catch (_) {}
-          /* Mark this URL as video so re-activation builds a VideoCard */
+        if (!State.videoOverrides.has(url) && !State.imageOverrides.has(url)) {
           State.videoOverrides.add(url);
-          /* Rebuild the slot as a video card */
           var parentSlot = card.closest('.vslot');
           if (parentSlot) {
-            zoom.destroy();
+            if (box._destroy) box._destroy();
+            else zoom.destroy();
             var idx = parseInt(parentSlot.dataset.idx, 10);
             State.activeSet.delete(parentSlot);
             parentSlot.innerHTML = '';
             parentSlot.appendChild(VideoCard.build(idx));
             State.activeSet.add(parentSlot);
+            return;
           }
-        });
-        on(probe, 'error', function () {
-          clearTimeout(probeTimer);
-          try { probe.removeAttribute('src'); probe.load(); } catch (_) {}
-          spin.remove();
-          box.innerHTML = '<div class="card-err">\u26a0 Could not load<br>' +
-                          '<small style="opacity:.4;word-break:break-all;">' + url + '</small></div>';
-        });
-        probe.src = url;
+        }
+        spin.remove();
+        box.innerHTML = '<div class="card-err">\u26a0 Could not load<br>' +
+                        '<small style="opacity:.4;word-break:break-all;">' + url + '</small></div>';
       });
       img.src = url;
       rotateWrap.appendChild(img);
@@ -1162,13 +1161,19 @@
       });
       on(video, 'error', function () {
         if (errored) return;
-        /* First failure — retry once without crossOrigin and with clean URL */
-        if (!video._retried) {
-          video._retried = true;
-          video.removeAttribute('crossorigin');
-          video.src = url;
-          video.load();
-          return;
+        if (!State.imageOverrides.has(url) && !State.videoOverrides.has(url)) {
+          State.imageOverrides.add(url);
+          var parentSlot = card.closest('.vslot');
+          if (parentSlot) {
+            if (box._destroy) box._destroy();
+            else zoom.destroy();
+            var idx = parseInt(parentSlot.dataset.idx, 10);
+            State.activeSet.delete(parentSlot);
+            parentSlot.innerHTML = '';
+            parentSlot.appendChild(ImageCard.build(idx));
+            State.activeSet.add(parentSlot);
+            return;
+          }
         }
         errored = true; video._errored = true;
         spin.remove();
@@ -1242,15 +1247,15 @@
     }
 
     /* ── Build the underlying <video> element with sane defaults ──
-       preload="auto" → the browser fetches enough data to begin
-       playback immediately when the user hits play. Combined with
-       virtualization (only ~3 screens of cards are mounted at any
+       preload="metadata" → the browser fetches only metadata on load,
+       saving bandwidth and avoiding connection blocking. Combined with
+       virtualization (only ~2 screens of cards are mounted at any
        time), this is safe for 500+ video sets while still feeling
        instant. Videos always start PAUSED and MUTED. */
     function makeVideo(url, stored) {
       var v = document.createElement('video');
       v.className = 'card-video';
-      v.preload   = 'auto';
+      v.preload   = 'metadata';
       v.playsInline = true;
       /* Mute-by-default. Global "Mute All" overrides any per-video state
          on load; the user can still un-mute an individual video after. */
