@@ -234,6 +234,7 @@
     isLoading  : false,
     editStates : Object.create(null),
     videoStates: Object.create(null),
+    videoOverrides: new Set(), /* URLs confirmed as video via probe fallback */
     spaceHeld  : false,
     hoveredBox : null,
     hoveredVideoCard: null,
@@ -339,8 +340,11 @@
   /* ════════════════════════════════════════════════════════
      URL PARSE / VALIDATE / MEDIA TYPE
   ════════════════════════════════════════════════════════ */
-  var VIDEO_EXT_RE = /\.(mp4|webm|mov|m4v|ogv|ogg)(?:$|[?#])/i;
-  function getMediaType(url) { return url && VIDEO_EXT_RE.test(url) ? 'video' : 'image'; }
+  var VIDEO_EXT_RE = /\.(mp4|webm|mkv|mov|avi|m4v|ogv|ogg|ts|mpe?g|3gp|flv|m3u8)(?:$|[?#])/i;
+  function getMediaType(url) {
+    if (State.videoOverrides.has(url)) return 'video';
+    return url && VIDEO_EXT_RE.test(url) ? 'video' : 'image';
+  }
 
   function parseUrls(txt) {
     return txt.split(/[\n,]+/)
@@ -351,7 +355,7 @@
   function isValidUrl(s) {
     try {
       var u = new URL(s);
-      return u.protocol === 'http:' || u.protocol === 'https:' || u.protocol === 'data:';
+      return u.protocol === 'http:' || u.protocol === 'https:' || u.protocol === 'data:' || u.protocol === 'blob:';
     } catch (_) { return false; }
   }
   function refreshCount() { DOM.gCount.textContent = State.allUrls.length; }
@@ -703,6 +707,7 @@
       });
       DOM.gallery.innerHTML = '';
       State.allUrls = []; State.slots = []; State.activeSet = new Set();
+      State.videoOverrides.clear();
       VideoState.clear();
       refreshCount();
     }
@@ -982,9 +987,42 @@
         zoom.syncCursor();
       });
       on(img, 'error', function () {
-        spin.remove();
-        box.innerHTML = '<div class="card-err">\u26a0 Could not load<br>' +
-                        '<small style="opacity:.4;word-break:break-all;">' + url + '</small></div>';
+        /* The URL may actually be a video (signed URL, CDN, no extension).
+           Probe with a hidden <video> before giving up. */
+        var probe = document.createElement('video');
+        probe.preload = 'metadata';
+        probe.muted = true;
+        var probeTimer = setTimeout(function () {
+          /* Timed out — show error */
+          try { probe.removeAttribute('src'); probe.load(); } catch (_) {}
+          spin.remove();
+          box.innerHTML = '<div class="card-err">\u26a0 Could not load<br>' +
+                          '<small style="opacity:.4;word-break:break-all;">' + url + '</small></div>';
+        }, 10000);
+        on(probe, 'loadeddata', function () {
+          clearTimeout(probeTimer);
+          try { probe.pause(); probe.removeAttribute('src'); probe.load(); } catch (_) {}
+          /* Mark this URL as video so re-activation builds a VideoCard */
+          State.videoOverrides.add(url);
+          /* Rebuild the slot as a video card */
+          var parentSlot = card.closest('.vslot');
+          if (parentSlot) {
+            zoom.destroy();
+            var idx = parseInt(parentSlot.dataset.idx, 10);
+            State.activeSet.delete(parentSlot);
+            parentSlot.innerHTML = '';
+            parentSlot.appendChild(VideoCard.build(idx));
+            State.activeSet.add(parentSlot);
+          }
+        });
+        on(probe, 'error', function () {
+          clearTimeout(probeTimer);
+          try { probe.removeAttribute('src'); probe.load(); } catch (_) {}
+          spin.remove();
+          box.innerHTML = '<div class="card-err">\u26a0 Could not load<br>' +
+                          '<small style="opacity:.4;word-break:break-all;">' + url + '</small></div>';
+        });
+        probe.src = url;
       });
       img.src = url;
       rotateWrap.appendChild(img);
@@ -1124,6 +1162,14 @@
       });
       on(video, 'error', function () {
         if (errored) return;
+        /* First failure — retry once without crossOrigin and with clean URL */
+        if (!video._retried) {
+          video._retried = true;
+          video.removeAttribute('crossorigin');
+          video.src = url;
+          video.load();
+          return;
+        }
         errored = true; video._errored = true;
         spin.remove();
         box.innerHTML = '<div class="card-err">\u26a0 Could not load video<br>' +
@@ -1211,14 +1257,8 @@
       v.muted   = GlobalVid.muteAll ? true : (stored.muted !== false);
       v.volume  = stored.volume;
       v.controls = false;
-      v.crossOrigin = 'anonymous';     /* needed for snapshot toDataURL */
       v.style.maxHeight = State.currentMaxH;
-      /* Render the first frame as a built-in thumbnail before playback. */
-      v.setAttribute('preload', 'auto');
-      try {
-        var sep = url.indexOf('#') >= 0 ? '&' : '#';
-        v.src = url + sep + 't=0.1';
-      } catch (_) { v.src = url; }
+      v.src = url;
 
       /* Cap concurrent playbacks: when this video starts, pause every
          other one in the gallery.  Keeps decoder + network usage flat
