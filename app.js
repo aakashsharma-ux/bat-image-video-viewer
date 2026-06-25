@@ -79,102 +79,9 @@
       }
       return fallbackCopy(text);
     }
-    function downloadImage(url) {
-      /* ── Filename extraction ──────────────────────────────────────
-         Strip query-string and fragment from the last path segment.
-         name stays null when no extension is found so we can fill it
-         in from the blob's Content-Type after a successful fetch.      */
-      var raw    = url.split('/').pop().split(/[?#]/)[0];
-      var hasExt = /\.[a-zA-Z0-9]{2,5}$/.test(raw);
-      var name   = hasExt ? raw : null;
-
-      /* ── Blob → file download ────────────────────────────────── */
-      function triggerBlobDownload(blob) {
-        var filename = name;
-        if (!filename) {
-          /* Derive extension from Content-Type (e.g. image/jpeg → .jpg) */
-          var mime = (blob.type || 'image/jpeg').split(';')[0].trim();
-          var sub  = mime.split('/')[1] || 'jpg';
-          sub = sub === 'jpeg' ? 'jpg' : sub;
-          filename = 'image.' + sub;
-        }
-        var blobUrl = URL.createObjectURL(blob);
-        var a = document.createElement('a');
-        a.href     = blobUrl;
-        a.download = filename;
-        a.style.display = 'none';
-        document.body.appendChild(a);
-        a.click();
-        setTimeout(function () {
-          document.body.removeChild(a);
-          URL.revokeObjectURL(blobUrl);
-        }, 5000);
-      }
-
-      /* ── Single fetch with configurable timeout ─────────────────
-         ms defaults to 10 000.  CORS failures are instant (the browser
-         rejects them before any network round-trip) so the timeout only
-         matters for genuinely slow or hung upstream servers.            */
-      function safeFetch(fetchUrl, ms) {
-        var timeout = new Promise(function (_, reject) {
-          setTimeout(function () { reject(new Error('timeout')); }, ms || 10000);
-        });
-        var request = fetch(fetchUrl, { credentials: 'omit' })
-          .then(function (res) {
-            if (!res.ok) throw new Error('HTTP ' + res.status);
-            return res.blob();
-          });
-        return Promise.race([request, timeout]);
-      }
-
-      /* ── Proxy cascade ───────────────────────────────────────────
-         Stage 1 — Direct fetch (8 s).
-           Works for same-origin URLs and any host that sends permissive
-           CORS headers: most CDNs, Imgur, Wikimedia, GitHub raw, etc.
-           CORS failures are synchronous browser rejections — fast.
-
-         Stage 2 — BAT-Viewer backend proxy /api/proxy-download (8 s).
-           The Node.js server fetches the image server-side with real
-           browser headers, bypassing all browser CORS restrictions and
-           CDN IP-blocking.  This is the most reliable path for hosts
-           like NYT / Reddit that actively block public proxy services.
-           Falls through quickly (connection refused) when the backend
-           is not running (e.g. opening index.html directly).
-
-         Stage 3 — images.weserv.nl (12 s).
-           A long-running dedicated image-proxy CDN that re-serves images
-           with permissive CORS headers.  Works for many hosts that block
-           generic proxy services.
-
-         Stage 4 — corsproxy.io current API (12 s).
-           Bare encoded URL as the entire query string (no "url=" key).
-
-         Stage 5 — allorigins.win /raw (12 s).
-           Independent service; failure on one proxy does not affect it.  */
-      var enc = encodeURIComponent(url);
-      var proxies = [
-        function () { return safeFetch(url, 8000); },
-        function () { return safeFetch('/api/proxy-download?url=' + enc, 8000); },
-        function () { return safeFetch('https://images.weserv.nl/?url=' + enc, 12000); },
-        function () { return safeFetch('https://corsproxy.io/?' + enc, 12000); },
-        function () { return safeFetch('https://api.allorigins.win/raw?url=' + enc, 12000); }
-      ];
-
-      function tryNext(i) {
-        if (i >= proxies.length) {
-          return Promise.reject(new Error('All download methods failed'));
-        }
-        return proxies[i]().catch(function () { return tryNext(i + 1); });
-      }
-
-      return tryNext(0).then(triggerBlobDownload);
-      /* Remaining rejection propagates to the button's .catch handler
-         which shows "Failed ✕" — never a silent new-tab fallback.      */
-    }
     return {
       $: $, el: el, on: on, stop: stop, isTyping: isTyping,
-      clamp: clamp, fmtTime: fmtTime, copyToClipboard: copyToClipboard,
-      downloadImage: downloadImage
+      clamp: clamp, fmtTime: fmtTime, copyToClipboard: copyToClipboard
     };
   })();
 
@@ -568,46 +475,6 @@
         });
       });
 
-      /* ── Download button (image cards only, opt-in via showDownload) ── */
-      var dlBtn = null;
-      if (opts.showDownload) {
-        dlBtn = makeBtn('tdownload', 'Download');
-        var dlTid = null;
-        on(dlBtn, 'click', function (ev) {
-          ev && ev.stopPropagation && ev.stopPropagation();
-          if (dlBtn.disabled) return;
-          dlBtn.textContent = 'Saving\u2026';
-          dlBtn.classList.add('loading');
-          dlBtn.disabled = true;
-          Util.downloadImage(opts.url)
-            .then(function () {
-              dlBtn.textContent = 'Saved!';
-              dlBtn.classList.remove('loading');
-              dlBtn.classList.add('ok');
-              dlBtn.disabled = false;
-              clearTimeout(dlTid);
-              dlTid = setTimeout(function () {
-                dlBtn.textContent = 'Download';
-                dlBtn.classList.remove('ok');
-              }, 2000);
-            })
-            .catch(function () {
-              /* Both direct fetch and the CORS proxy failed (e.g. the
-                 host blocks all external access, or the user is offline).
-                 Show a clear error state — never silently open a new tab. */
-              dlBtn.textContent = 'Failed \u2715';
-              dlBtn.classList.remove('loading');
-              dlBtn.classList.add('err');
-              dlBtn.disabled = false;
-              clearTimeout(dlTid);
-              dlTid = setTimeout(function () {
-                dlBtn.textContent = 'Download';
-                dlBtn.classList.remove('err');
-              }, 3000);
-            });
-        });
-      }
-
       var editBtn = makeBtn('tedit', 'Edit');
       on(editBtn, 'click', function () { opts.onEdit && opts.onEdit(editBtn); });
 
@@ -615,7 +482,6 @@
       on(removeBtn, 'click', function () { opts.onRemove && opts.onRemove(); });
 
       bar.appendChild(copyBtn);
-      if (dlBtn) bar.appendChild(dlBtn);
       bar.appendChild(editBtn);
       bar.appendChild(removeBtn);
       return bar;
@@ -1043,7 +909,6 @@
       card.appendChild(Chrome.urlRow(url));
       card.appendChild(Chrome.toolbar({
         url: url,
-        showDownload: true,
         onEdit: function () {
           if (card.classList.contains('editing')) {
             EditMode.exit(false);
