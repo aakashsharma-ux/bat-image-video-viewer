@@ -66,9 +66,10 @@ function proxyDownload(req, res) {
   /* Allow preflight if the frontend is on a different port during dev */
   if (req.method === 'OPTIONS') {
     res.writeHead(204, {
-      'Access-Control-Allow-Origin' : '*',
-      'Access-Control-Allow-Methods': 'GET, OPTIONS',
-      'Access-Control-Max-Age'      : '86400',
+      'Access-Control-Allow-Origin'          : '*',
+      'Access-Control-Allow-Methods'         : 'GET, OPTIONS',
+      'Access-Control-Allow-Private-Network' : 'true',
+      'Access-Control-Max-Age'               : '86400',
     });
     return res.end();
   }
