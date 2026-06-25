@@ -508,6 +508,17 @@ body.edit-active .card:not(.editing) {
   color: var(--text-err); font-size: 10px; width: 100%;
   transition: color 0.35s;
 }
+.card-retry-btn {
+  display: block; margin: 10px auto 0;
+  padding: 4px 14px;
+  background: transparent;
+  border: 1px solid var(--gold);
+  color: var(--gold);
+  font-size: 10px; font-family: inherit;
+  border-radius: 3px; cursor: pointer;
+  transition: background 0.2s, color 0.2s;
+}
+.card-retry-btn:hover { background: var(--gold); color: #000; }
 
 /* URL row */
 .card-url-row {

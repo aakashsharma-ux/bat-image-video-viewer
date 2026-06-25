@@ -865,12 +865,16 @@
         rotateWrap.style.transform = 'rotate(' + stored.rotation + 'deg)';
       }
 
+      var activeSpin = spin;
+      var retrying   = false;
+
       on(img, 'load', function () {
-        spin.remove();
+        if (activeSpin) { activeSpin.remove(); activeSpin = null; }
         if (img.naturalWidth) h.dimsEl.textContent = img.naturalWidth + ' \u00d7 ' + img.naturalHeight;
         zoom.syncCursor();
       });
       on(img, 'error', function () {
+        if (retrying) return;
         if (!State.videoOverrides.has(url) && !State.imageOverrides.has(url)) {
           State.videoOverrides.add(url);
           var parentSlot = card.closest('.vslot');
@@ -885,9 +889,28 @@
             return;
           }
         }
-        spin.remove();
-        box.innerHTML = '<div class="card-err">\u26a0 Could not load<br>' +
-                        '<small style="opacity:.4;word-break:break-all;">' + url + '</small></div>';
+        if (activeSpin) { activeSpin.remove(); activeSpin = null; }
+        if (rotateWrap.parentNode === box) box.removeChild(rotateWrap);
+        if (badge.parentNode      === box) box.removeChild(badge);
+        if (hint.parentNode       === box) box.removeChild(hint);
+        var errDiv   = el('div', 'card-err');
+        errDiv.innerHTML = '\u26a0 Could not load<br>' +
+          '<small style="opacity:.4;word-break:break-all;">' + url + '</small>';
+        var retryBtn = el('button', 'card-retry-btn');
+        retryBtn.textContent = '\u21ba Retry';
+        on(retryBtn, 'click', function () {
+          box.removeChild(errDiv);
+          activeSpin = el('div', 'card-spinner', '<div class="spinner"></div>');
+          box.appendChild(activeSpin);
+          box.appendChild(rotateWrap);
+          box.appendChild(badge);
+          box.appendChild(hint);
+          retrying = true;
+          img.src  = '';
+          setTimeout(function () { retrying = false; img.src = url; }, 50);
+        });
+        errDiv.appendChild(retryBtn);
+        box.appendChild(errDiv);
       });
       img.src = url;
       rotateWrap.appendChild(img);
@@ -1037,8 +1060,27 @@
         }
         errored = true; video._errored = true;
         spin.remove();
-        box.innerHTML = '<div class="card-err">\u26a0 Could not load video<br>' +
-                        '<small style="opacity:.4;word-break:break-all;">' + url + '</small></div>';
+        video.removeAttribute('src'); video.load();  /* stop network activity */
+        box.innerHTML = '';
+        var errDiv   = el('div', 'card-err');
+        errDiv.innerHTML = '\u26a0 Could not load video<br>' +
+          '<small style="opacity:.4;word-break:break-all;">' + url + '</small>';
+        var retryBtn = el('button', 'card-retry-btn');
+        retryBtn.textContent = '\u21ba Retry';
+        on(retryBtn, 'click', function () {
+          State.videoOverrides.delete(url);
+          State.imageOverrides.delete(url);
+          var parentSlot = card.closest('.vslot');
+          if (parentSlot) {
+            var idx = parseInt(parentSlot.dataset.idx, 10);
+            State.activeSet.delete(parentSlot);
+            parentSlot.innerHTML = '';
+            parentSlot.appendChild(VideoCard.build(idx));
+            State.activeSet.add(parentSlot);
+          }
+        });
+        errDiv.appendChild(retryBtn);
+        box.appendChild(errDiv);
       });
 
       function persist() {
