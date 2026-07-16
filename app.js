@@ -184,10 +184,10 @@
       if (status === MEDIA_STATUS.LOADED) s.retryCount = 0;
       return s;
     },
-    beginRetry: function (url, type) {
+    beginRetry: function (url, type, applyLimit) {
       var s = MediaState.get(url);
-      if (s.retryCount >= RETRY_CONFIG.maxRetries) return false;
-      s.retryCount++;
+      if (applyLimit && s.retryCount >= RETRY_CONFIG.maxRetries) return false;
+      if (applyLimit) s.retryCount++;
       s.status = MEDIA_STATUS.LOADING;
       if (type) s.type = type;
       return true;
@@ -1022,13 +1022,13 @@
         box.appendChild(errDiv);
       }
 
-      function retryImage(fromLoading) {
+      function retryImage(fromLoading, applyLimit) {
         if (retryInFlight) return Promise.resolve(false);
         var current = MediaState.get(url);
         if (!fromLoading && current.status !== MEDIA_STATUS.FAILED) {
           return Promise.resolve(false);
         }
-        if (!MediaState.beginRetry(url, 'image')) {
+        if (!MediaState.beginRetry(url, 'image', applyLimit === true)) {
           Toast.show('Maximum retries reached for this media.', 'err', 2600);
           return Promise.resolve(false);
         }
@@ -1042,7 +1042,7 @@
           setTimeout(function () {
             suppressErrors = false;
             img.src = url;
-          }, RETRY_CONFIG.delayMs + (MediaState.get(url).retryCount - 1) * RETRY_CONFIG.backoffMs);
+          }, RETRY_CONFIG.delayMs + (applyLimit === true ? (MediaState.get(url).retryCount - 1) * RETRY_CONFIG.backoffMs : 0));
         });
       }
 
@@ -1212,13 +1212,13 @@
         card.dataset.mediaStatus = status;
       }
 
-      function retryVideo(fromLoading) {
+      function retryVideo(fromLoading, applyLimit) {
         if (retryInFlight) return Promise.resolve(false);
         var current = MediaState.get(url);
         if (!fromLoading && current.status !== MEDIA_STATUS.FAILED) {
           return Promise.resolve(false);
         }
-        if (!MediaState.beginRetry(url, 'video')) {
+        if (!MediaState.beginRetry(url, 'video', applyLimit === true)) {
           Toast.show('Maximum retries reached for this media.', 'err', 2600);
           return Promise.resolve(false);
         }
@@ -1249,7 +1249,7 @@
             retryInFlight = false;
             resolveMediaRetry(url, false);
           }
-        }, RETRY_CONFIG.delayMs + (MediaState.get(url).retryCount - 1) * RETRY_CONFIG.backoffMs);
+        }, RETRY_CONFIG.delayMs + (applyLimit === true ? (MediaState.get(url).retryCount - 1) * RETRY_CONFIG.backoffMs : 0));
         return wait;
       }
 
@@ -1713,7 +1713,7 @@
         }
 
         var task = tasks[next++];
-        Promise.resolve(task.card._retryMedia(false))
+        Promise.resolve(task.card._retryMedia(false, true))
           .then(function (success) { if (success) ok++; })
           .catch(function () {})
           .then(function () {
