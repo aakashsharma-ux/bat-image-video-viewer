@@ -492,7 +492,7 @@ body.edit-active .card:not(.editing) {
 
 .card-spinner {
   position: absolute; inset: 0; min-height: 60px;
-  display: flex; align-items: center; justify-content: center;
+  display: flex; align-items: center; justify-content: center; flex-direction: column; gap: 10px;
   background: var(--bg-spinner); z-index: 2;
   transition: background 0.35s ease;
 }
@@ -519,6 +519,23 @@ body.edit-active .card:not(.editing) {
   transition: background 0.2s, color 0.2s;
 }
 .card-retry-btn:hover { background: var(--gold); color: #000; }
+.card-loading-retry-btn {
+  padding: 4px 12px;
+  background: rgba(0,0,0,0.34);
+  border: 1px solid var(--gold);
+  color: var(--gold);
+  font-size: 9px; font-weight: 800; font-family: inherit;
+  text-transform: uppercase; letter-spacing: 0.6px;
+  border-radius: 3px; cursor: pointer;
+  pointer-events: auto;
+  transition: background 0.2s, color 0.2s, opacity 0.2s;
+}
+.card-loading-retry-btn:hover { background: var(--gold); color: #000; }
+.card-loading-retry-btn:disabled,
+.card-retry-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
 
 /* URL row */
 .card-url-row {

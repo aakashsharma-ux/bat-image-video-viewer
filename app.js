@@ -113,6 +113,7 @@
     scrollBadge  : $('scrollBadge'),
     zoomEnabled           : $('zoomEnabled'),
     fastImageProcessing   : $('fastImageProcessing'),
+    retryVisibleFailedBtn : $('retryVisibleFailedBtn'),
     themeToggle           : $('themeToggle'),
     themeLabel   : $('themeLabel'),
     helpBtn      : $('helpBtn'),
@@ -141,12 +142,65 @@
     isLoading  : false,
     editStates : Object.create(null),
     videoStates: Object.create(null),
+    mediaStates: Object.create(null),
+    retryWaiters: Object.create(null),
     videoOverrides: new Set(), /* URLs confirmed as video via probe fallback */
     imageOverrides: new Set(), /* URLs confirmed as image via fallback */
     spaceHeld  : false,
     hoveredBox : null,
     hoveredVideoCard: null,
     currentMaxH: '220px'
+  };
+
+  var MEDIA_STATUS = {
+    LOADED : 'loaded',
+    LOADING: 'loading',
+    FAILED : 'failed'
+  };
+
+  var RETRY_CONFIG = {
+    maxRetries : 3,
+    concurrency: 4,
+    delayMs    : 220,
+    backoffMs  : 260
+  };
+
+  var MediaState = {
+    get: function (url) {
+      var s = State.mediaStates[url];
+      if (!s) {
+        s = State.mediaStates[url] = {
+          status: null,
+          type: null,
+          retryCount: 0
+        };
+      }
+      return s;
+    },
+    set: function (url, status, type) {
+      var s = MediaState.get(url);
+      s.status = status;
+      if (type) s.type = type;
+      if (status === MEDIA_STATUS.LOADED) s.retryCount = 0;
+      return s;
+    },
+    beginRetry: function (url, type) {
+      var s = MediaState.get(url);
+      if (s.retryCount >= RETRY_CONFIG.maxRetries) return false;
+      s.retryCount++;
+      s.status = MEDIA_STATUS.LOADING;
+      if (type) s.type = type;
+      return true;
+    },
+    canRetry: function (url) {
+      return MediaState.get(url).retryCount < RETRY_CONFIG.maxRetries;
+    },
+    clear: function () {
+      State.mediaStates = Object.create(null);
+    },
+    remove: function (url) {
+      delete State.mediaStates[url];
+    }
   };
 
   /* ════════════════════════════════════════════════════════
@@ -162,6 +216,45 @@
     }
     return { show: show };
   })();
+
+  function makeLoadingSpinner(onRetry) {
+    var spin = el('div', 'card-spinner');
+    spin.appendChild(el('div', 'spinner'));
+    var retryBtn = el('button', 'card-loading-retry-btn');
+    retryBtn.type = 'button';
+    retryBtn.textContent = 'Retry';
+    retryBtn.title = 'Cancel this request and retry this media';
+    on(retryBtn, 'click', function (e) {
+      e.preventDefault();
+      e.stopPropagation();
+      if (typeof onRetry === 'function') onRetry();
+    });
+    spin.appendChild(retryBtn);
+    return spin;
+  }
+
+  function isOnScreen(node) {
+    if (!node || !node.getBoundingClientRect) return false;
+    var r = node.getBoundingClientRect();
+    var vw = window.innerWidth || document.documentElement.clientWidth;
+    var vh = window.innerHeight || document.documentElement.clientHeight;
+    return r.width > 0 && r.height > 0 && r.bottom > 0 && r.right > 0 &&
+           r.top < vh && r.left < vw;
+  }
+
+  function waitForMediaRetry(url) {
+    return new Promise(function (resolve) {
+      State.retryWaiters[url] = resolve;
+    });
+  }
+
+  function resolveMediaRetry(url, ok) {
+    var resolve = State.retryWaiters[url];
+    if (resolve) {
+      delete State.retryWaiters[url];
+      resolve(ok);
+    }
+  }
 
   /* ════════════════════════════════════════════════════════
      THEME
@@ -499,6 +592,8 @@
       State.allUrls.splice(idx, 1);
       delete State.editStates[url];
       delete State.videoStates[url];
+      MediaState.remove(url);
+      delete State.retryWaiters[url];
 
       var removedSlot = State.slots.splice(idx, 1)[0];
       State.activeSet.delete(removedSlot);
@@ -593,6 +688,8 @@
       State.videoOverrides.clear();
       State.imageOverrides.clear();
       VideoState.clear();
+      MediaState.clear();
+      State.retryWaiters = Object.create(null);
       refreshCount();
     }
     function appendUrls(urls) {
@@ -611,7 +708,7 @@
       refreshCount();
     }
     return {
-      makeSlot: makeSlot, rebuildObserver: rebuildObserver,
+      makeSlot: makeSlot, activate: activate, rebuildObserver: rebuildObserver,
       clear: clear, appendUrls: appendUrls
     };
   })();
@@ -846,7 +943,7 @@
 
       /* Image box */
       var box = el('div', 'card-img-box');
-      var spin = el('div', 'card-spinner', '<div class="spinner"></div>');
+      var spin = makeLoadingSpinner(function () { retryImage(true); });
       box.appendChild(spin);
 
       var rotateWrap = el('div', 'img-rotate-wrap');
@@ -866,15 +963,98 @@
       }
 
       var activeSpin = spin;
-      var retrying   = false;
+      var errDiv = null;
+      var suppressErrors = false;
+      var pendingRetry = null;
+      var retryInFlight = false;
+
+      function syncCardStatus(status) {
+        MediaState.set(url, status, 'image');
+        card.dataset.mediaStatus = status;
+      }
+
+      function resolveRetry(ok) {
+        if (pendingRetry) {
+          pendingRetry(ok);
+          pendingRetry = null;
+        }
+        retryInFlight = false;
+        resolveMediaRetry(url, ok);
+      }
+
+      function cancelImageRequest() {
+        suppressErrors = true;
+        img.removeAttribute('src');
+        img.src = '';
+        if (activeSpin) { activeSpin.remove(); activeSpin = null; }
+        syncCardStatus(MEDIA_STATUS.FAILED);
+      }
+
+      function restoreLoadingView() {
+        if (errDiv && errDiv.parentNode) errDiv.parentNode.removeChild(errDiv);
+        errDiv = null;
+        if (!activeSpin) {
+          activeSpin = makeLoadingSpinner(function () { retryImage(true); });
+          box.appendChild(activeSpin);
+        }
+        if (rotateWrap.parentNode !== box) box.appendChild(rotateWrap);
+        if (badge.parentNode      !== box) box.appendChild(badge);
+        if (hint.parentNode       !== box) box.appendChild(hint);
+      }
+
+      function showFailedView(resolvePending) {
+        if (activeSpin) { activeSpin.remove(); activeSpin = null; }
+        if (rotateWrap.parentNode === box) box.removeChild(rotateWrap);
+        if (badge.parentNode      === box) box.removeChild(badge);
+        if (hint.parentNode       === box) box.removeChild(hint);
+        syncCardStatus(MEDIA_STATUS.FAILED);
+        if (resolvePending) resolveRetry(false);
+        if (errDiv && errDiv.parentNode) return;
+        errDiv = el('div', 'card-err');
+        errDiv.innerHTML = '\u26a0 Could not load<br>' +
+          '<small style="opacity:.4;word-break:break-all;">' + url + '</small>';
+        var retryBtn = el('button', 'card-retry-btn');
+        retryBtn.textContent = '\u21ba Retry';
+        on(retryBtn, 'click', function () {
+          retryImage(false);
+        });
+        errDiv.appendChild(retryBtn);
+        box.appendChild(errDiv);
+      }
+
+      function retryImage(fromLoading) {
+        if (retryInFlight) return Promise.resolve(false);
+        var current = MediaState.get(url);
+        if (!fromLoading && current.status !== MEDIA_STATUS.FAILED) {
+          return Promise.resolve(false);
+        }
+        if (!MediaState.beginRetry(url, 'image')) {
+          Toast.show('Maximum retries reached for this media.', 'err', 2600);
+          return Promise.resolve(false);
+        }
+        retryInFlight = true;
+        card.dataset.mediaStatus = MEDIA_STATUS.LOADING;
+        cancelImageRequest();
+        restoreLoadingView();
+        syncCardStatus(MEDIA_STATUS.LOADING);
+        return new Promise(function (resolve) {
+          pendingRetry = resolve;
+          setTimeout(function () {
+            suppressErrors = false;
+            img.src = url;
+          }, RETRY_CONFIG.delayMs + (MediaState.get(url).retryCount - 1) * RETRY_CONFIG.backoffMs);
+        });
+      }
 
       on(img, 'load', function () {
         if (activeSpin) { activeSpin.remove(); activeSpin = null; }
+        syncCardStatus(MEDIA_STATUS.LOADED);
+        resolveRetry(true);
         if (img.naturalWidth) h.dimsEl.textContent = img.naturalWidth + ' \u00d7 ' + img.naturalHeight;
         zoom.syncCursor();
       });
       on(img, 'error', function () {
-        if (retrying) return;
+        if (suppressErrors) return;
         if (!State.videoOverrides.has(url) && !State.imageOverrides.has(url)) {
           State.videoOverrides.add(url);
           var parentSlot = card.closest('.vslot');
@@ -889,30 +1069,8 @@
             return;
           }
         }
-        if (activeSpin) { activeSpin.remove(); activeSpin = null; }
-        if (rotateWrap.parentNode === box) box.removeChild(rotateWrap);
-        if (badge.parentNode      === box) box.removeChild(badge);
-        if (hint.parentNode       === box) box.removeChild(hint);
-        var errDiv   = el('div', 'card-err');
-        errDiv.innerHTML = '\u26a0 Could not load<br>' +
-          '<small style="opacity:.4;word-break:break-all;">' + url + '</small>';
-        var retryBtn = el('button', 'card-retry-btn');
-        retryBtn.textContent = '\u21ba Retry';
-        on(retryBtn, 'click', function () {
-          box.removeChild(errDiv);
-          activeSpin = el('div', 'card-spinner', '<div class="spinner"></div>');
-          box.appendChild(activeSpin);
-          box.appendChild(rotateWrap);
-          box.appendChild(badge);
-          box.appendChild(hint);
-          retrying = true;
-          img.src  = '';
-          setTimeout(function () { retrying = false; img.src = url; }, 50);
-        });
-        errDiv.appendChild(retryBtn);
-        box.appendChild(errDiv);
+        showFailedView(true);
       });
-      img.src = url;
       rotateWrap.appendChild(img);
       box.appendChild(rotateWrap);
 
@@ -923,8 +1081,23 @@
       box.appendChild(badge); box.appendChild(hint);
 
       var zoom = attachZoom(card, box, img, badge);
-      box._destroy = zoom.destroy;
+      box._retryMedia = retryImage;
+      card._retryMedia = retryImage;
+      box._destroy = function () {
+        suppressErrors = true;
+        img.removeAttribute('src');
+        img.src = '';
+        resolveRetry(false);
+        zoom.destroy();
+      };
       zoom.syncCursor();
+
+      if (MediaState.get(url).status === MEDIA_STATUS.FAILED) {
+        showFailedView(false);
+      } else {
+        syncCardStatus(MEDIA_STATUS.LOADING);
+        img.src = url;
+      }
 
       /* Compose */
       card.appendChild(h.hdr);
@@ -940,7 +1113,7 @@
             EditMode.enter(card, url);
           }
         },
-        onRemove: function () { Chrome.removeCard(card, ci, zoom.destroy); }
+        onRemove: function () { Chrome.removeCard(card, ci, box._destroy); }
       }));
       return card;
     }
@@ -970,17 +1143,18 @@
     function build(ci) {
       var url = State.allUrls[ci];
       var stored = VideoState.get(url);
+      var startsFailed = MediaState.get(url).status === MEDIA_STATUS.FAILED;
 
       var card = el('div', 'card card-video-card');
       var h = Chrome.header(ci + 1, 'video');
 
       /* Media surface */
       var box = el('div', 'card-img-box card-video-box');
-      var spin = el('div', 'card-spinner', '<div class="spinner"></div>');
+      var spin = makeLoadingSpinner(function () { retryVideo(true); });
       box.appendChild(spin);
 
       var rotateWrap = el('div', 'img-rotate-wrap');
-      var video = makeVideo(url, stored);
+      var video = makeVideo(url, stored, !startsFailed);
       rotateWrap.appendChild(video);
       box.appendChild(rotateWrap);
 
@@ -1030,8 +1204,81 @@
 
       /* Lifecycle: load/error/state-sync */
       var errored = false;
+      var suppressErrors = false;
+      var retryInFlight = false;
+
+      function syncCardStatus(status) {
+        MediaState.set(url, status, 'video');
+        card.dataset.mediaStatus = status;
+      }
+
+      function retryVideo(fromLoading) {
+        if (retryInFlight) return Promise.resolve(false);
+        var current = MediaState.get(url);
+        if (!fromLoading && current.status !== MEDIA_STATUS.FAILED) {
+          return Promise.resolve(false);
+        }
+        if (!MediaState.beginRetry(url, 'video')) {
+          Toast.show('Maximum retries reached for this media.', 'err', 2600);
+          return Promise.resolve(false);
+        }
+        retryInFlight = true;
+        card.dataset.mediaStatus = MEDIA_STATUS.LOADING;
+        suppressErrors = true;
+        try { video.pause(); } catch (_) {}
+        video.removeAttribute('src');
+        try { video.load(); } catch (_) {}
+        syncCardStatus(MEDIA_STATUS.LOADING);
+        box.innerHTML = '';
+        spin = makeLoadingSpinner(function () { retryVideo(true); });
+        box.appendChild(spin);
+
+        var wait = waitForMediaRetry(url);
+        setTimeout(function () {
+          State.videoOverrides.delete(url);
+          State.imageOverrides.delete(url);
+          var parentSlot = card.closest('.vslot');
+          if (parentSlot) {
+            if (box._destroy) box._destroy();
+            var idx = parseInt(parentSlot.dataset.idx, 10);
+            State.activeSet.delete(parentSlot);
+            parentSlot.innerHTML = '';
+            parentSlot.appendChild(VideoCard.build(idx));
+            State.activeSet.add(parentSlot);
+          } else {
+            retryInFlight = false;
+            resolveMediaRetry(url, false);
+          }
+        }, RETRY_CONFIG.delayMs + (MediaState.get(url).retryCount - 1) * RETRY_CONFIG.backoffMs);
+        return wait;
+      }
+
+      function showFailedView(resolvePending) {
+        errored = true; video._errored = true;
+        if (spin.parentNode) spin.remove();
+        syncCardStatus(MEDIA_STATUS.FAILED);
+        if (resolvePending) resolveMediaRetry(url, false);
+        retryInFlight = false;
+        video.removeAttribute('src');
+        try { video.load(); } catch (_) {}
+        box.innerHTML = '';
+        var errDiv = el('div', 'card-err');
+        errDiv.innerHTML = '\u26a0 Could not load video<br>' +
+          '<small style="opacity:.4;word-break:break-all;">' + url + '</small>';
+        var retryBtn = el('button', 'card-retry-btn');
+        retryBtn.textContent = '\u21ba Retry';
+        on(retryBtn, 'click', function () {
+          retryVideo(false);
+        });
+        errDiv.appendChild(retryBtn);
+        box.appendChild(errDiv);
+      }
+
+      if (!startsFailed) syncCardStatus(MEDIA_STATUS.LOADING);
       on(video, 'loadedmetadata', function () {
-        spin.remove();
+        if (spin.parentNode) spin.remove();
+        syncCardStatus(MEDIA_STATUS.LOADED);
+        resolveMediaRetry(url, true);
         if (video.videoWidth) {
           h.dimsEl.textContent = video.videoWidth + ' \u00d7 ' + video.videoHeight +
                                  ' \u2022 ' + Util.fmtTime(video.duration);
@@ -1043,6 +1290,7 @@
         controlsApi.onMetadata();
       });
       on(video, 'error', function () {
+        if (suppressErrors) return;
         if (errored) return;
         if (!State.imageOverrides.has(url) && !State.videoOverrides.has(url)) {
           State.imageOverrides.add(url);
@@ -1058,29 +1306,7 @@
             return;
           }
         }
-        errored = true; video._errored = true;
-        spin.remove();
-        video.removeAttribute('src'); video.load();  /* stop network activity */
-        box.innerHTML = '';
-        var errDiv   = el('div', 'card-err');
-        errDiv.innerHTML = '\u26a0 Could not load video<br>' +
-          '<small style="opacity:.4;word-break:break-all;">' + url + '</small>';
-        var retryBtn = el('button', 'card-retry-btn');
-        retryBtn.textContent = '\u21ba Retry';
-        on(retryBtn, 'click', function () {
-          State.videoOverrides.delete(url);
-          State.imageOverrides.delete(url);
-          var parentSlot = card.closest('.vslot');
-          if (parentSlot) {
-            var idx = parseInt(parentSlot.dataset.idx, 10);
-            State.activeSet.delete(parentSlot);
-            parentSlot.innerHTML = '';
-            parentSlot.appendChild(VideoCard.build(idx));
-            State.activeSet.add(parentSlot);
-          }
-        });
-        errDiv.appendChild(retryBtn);
-        box.appendChild(errDiv);
+        showFailedView(true);
       });
 
       function persist() {
@@ -1114,7 +1340,10 @@
       }
 
       /* Memory release hook */
+      box._retryMedia = retryVideo;
+      card._retryMedia = retryVideo;
       box._destroy = function () {
+        suppressErrors = true;
         try { video.pause(); } catch (_) {}
         persist();
         zoom.destroy();
@@ -1145,6 +1374,7 @@
       /* Expose for keyboard handler */
       card._video     = video;
       card._frameStep = frameStep;
+      if (startsFailed) showFailedView(false);
       return card;
     }
 
@@ -1154,7 +1384,7 @@
        virtualization (only ~2 screens of cards are mounted at any
        time), this is safe for 500+ video sets while still feeling
        instant. Videos always start PAUSED and MUTED. */
-    function makeVideo(url, stored) {
+    function makeVideo(url, stored, shouldLoad) {
       var v = document.createElement('video');
       v.className = 'card-video';
       v.preload   = 'metadata';
@@ -1165,7 +1395,7 @@
       v.volume  = stored.volume;
       v.controls = false;
       v.style.maxHeight = State.currentMaxH;
-      v.src = url;
+      if (shouldLoad !== false) v.src = url;
 
       /* Cap concurrent playbacks: when this video starts, pause every
          other one in the gallery.  Keeps decoder + network usage flat
@@ -1406,6 +1636,116 @@
     State.hoveredBox        = (t.closest && t.closest('.card-img-box')) || null;
     State.hoveredVideoCard  = (t.closest && t.closest('.card-video-card')) || null;
   }, { passive: true });
+
+  /* ════════════════════════════════════════════════════════
+     VIEWPORT-WINDOW FAILED MEDIA RETRY
+  ════════════════════════════════════════════════════════ */
+  (function RetryVisibleFailed() {
+    var running = false;
+    var WINDOW_SIZE = 20;
+
+    function visibleAnchorIndex() {
+      var bestIdx = -1;
+      var bestTop = Infinity;
+      State.slots.forEach(function (slot) {
+        if (!isOnScreen(slot)) return;
+        var idx = parseInt(slot.dataset.idx, 10);
+        if (!isFinite(idx)) return;
+        var top = slot.getBoundingClientRect().top;
+        if (top >= 0 && top < bestTop) {
+          bestTop = top;
+          bestIdx = idx;
+        }
+      });
+      if (bestIdx !== -1) return bestIdx;
+
+      State.slots.forEach(function (slot) {
+        if (!isOnScreen(slot)) return;
+        var idx = parseInt(slot.dataset.idx, 10);
+        if (bestIdx === -1 || idx < bestIdx) bestIdx = idx;
+      });
+      return bestIdx;
+    }
+
+    function collect() {
+      var tasks = [];
+      var anchor = visibleAnchorIndex();
+      if (anchor < 0) return tasks;
+
+      var end = Math.min(State.slots.length, anchor + WINDOW_SIZE);
+      for (var idx = anchor; idx < end; idx++) {
+        var slot = State.slots[idx];
+        var url = State.allUrls[idx];
+        if (!slot || !url) continue;
+
+        var mediaState = MediaState.get(url);
+        if (mediaState.status !== MEDIA_STATUS.FAILED) continue;
+        if (!MediaState.canRetry(url)) continue;
+
+        if (!State.activeSet.has(slot)) Virtual.activate(slot);
+        var card = slot.querySelector('.card');
+        if (!card || typeof card._retryMedia !== 'function') continue;
+        tasks.push({ url: url, card: card });
+      }
+      return tasks;
+    }
+
+    function runQueue(tasks) {
+      var next = 0;
+      var done = 0;
+      var ok = 0;
+      var finished = false;
+
+      function finish() {
+        if (finished) return;
+        finished = true;
+        running = false;
+        DOM.retryVisibleFailedBtn.disabled = false;
+        DOM.retryVisibleFailedBtn.innerHTML = '&#8634; Retry';
+        Toast.show('Retried ' + done + ' failed media item' +
+          (done !== 1 ? 's' : '') + (ok ? '; ' + ok + ' recovered.' : '.'), ok ? 'ok' : 'err', 3200);
+      }
+
+      function launch() {
+        if (next >= tasks.length) {
+          if (done >= tasks.length) finish();
+          return;
+        }
+
+        var task = tasks[next++];
+        Promise.resolve(task.card._retryMedia(false))
+          .then(function (success) { if (success) ok++; })
+          .catch(function () {})
+          .then(function () {
+            done++;
+            if (done >= tasks.length) {
+              finish();
+            } else {
+              setTimeout(launch, RETRY_CONFIG.delayMs);
+            }
+          });
+      }
+
+      for (var i = 0; i < RETRY_CONFIG.concurrency && i < tasks.length; i++) {
+        setTimeout(launch, i * RETRY_CONFIG.delayMs);
+      }
+    }
+
+    on(DOM.retryVisibleFailedBtn, 'click', function () {
+      if (running) return;
+      var tasks = collect();
+      if (!tasks.length) {
+        Toast.show('No failed media in the current 20-item window.', 'ok', 2200);
+        return;
+      }
+      running = true;
+      DOM.retryVisibleFailedBtn.disabled = true;
+      DOM.retryVisibleFailedBtn.textContent = 'Retrying...';
+      Toast.show('Retrying ' + tasks.length + ' failed media item' +
+        (tasks.length !== 1 ? 's' : '') + ' with limited concurrency.', 'ok', 2600);
+      runQueue(tasks);
+    });
+  })();
 
   /* ════════════════════════════════════════════════════════
      KEYBOARD
