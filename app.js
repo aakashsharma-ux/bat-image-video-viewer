@@ -340,27 +340,173 @@
 
   /* ════════════════════════════════════════════════════════
      URL PARSE / VALIDATE / MEDIA TYPE
+
+     Detection order (each step only runs if the previous one is
+     inconclusive):
+       1. File extension in the URL's PATH ONLY (authoritative,
+          instant, and immune to random signature/hash text elsewhere
+          in the URL that used to trip up the old "does the string
+          contain 'mov' anywhere" heuristic).
+       2. MIME/filename hints carried in S3 / CloudFront presigned-URL
+          query params (response-content-type, content-type,
+          response-content-disposition) — common when the S3 object
+          key itself has no extension.
+       3. A best-effort background HEAD request (probeContentType,
+          below) that reads the real Content-Type S3 returns for the
+          object. This never blocks rendering — the card renders with
+          its best current guess immediately and is corrected in place
+          if the probe later disagrees.
+       4. If everything above is inconclusive we still render with a
+          default guess, but that guess is NOT confident. Only
+          unconfident guesses are allowed a one-time swap-on-error in
+          ImageCard/VideoCard. A confidently-typed URL (steps 1-3) that
+          fails to load is treated as a genuine network/S3 failure and
+          goes through the normal retry path instead of being
+          reclassified as the other media type.
   ════════════════════════════════════════════════════════ */
-  var VIDEO_EXT_RE = /\.(mp4|webm|mkv|mov|avi|m4v|ogv|ogg|ts|mpe?g|3gp|flv|m3u8)(?:$|[?#])/i;
-  var IMAGE_EXT_RE = /\.(jpe?g|png|gif|webp|svg|bmp|ico|tiff?|avif|heic|heif)(?:$|[?#])/i;
+  /* Boundary is "end of string OR any non-alphanumeric character" rather
+     than just "?/#/end" — this still refuses to match inside a longer
+     word (so "movies" never matches ".mov") but it also correctly
+     matches an extension embedded in a query-param value, e.g. a quoted
+     filename from an S3 response-content-disposition hint
+     ("...filename=\"clip.mov\"") where a quote, semicolon, or ampersand
+     follows instead of a literal "?" or "#". */
+  var VIDEO_EXT_RE = /\.(mp4|webm|mkv|mov|avi|m4v|ogv|ogg|ts|mpe?g|3gp|flv|m3u8|wmv|vob|mts|m2ts)(?:$|[^a-z0-9])/i;
+  var IMAGE_EXT_RE = /\.(jpe?g|jfif|png|gif|webp|svg|bmp|ico|tiff?|avif|heic|heif)(?:$|[^a-z0-9])/i;
+
+  /* Query-string keys S3/CloudFront presigned URLs commonly carry the
+     object's real MIME type or original filename under, for objects
+     whose key itself is an extensionless hash/UUID. */
+  var S3_CONTENT_TYPE_PARAMS = ['response-content-type', 'content-type', 'x-amz-meta-content-type'];
+  var S3_FILENAME_PARAMS     = ['response-content-disposition', 'x-amz-meta-filename'];
+
+  /* Extension/hint-based detection only — no network calls, no
+     overrides. Returns 'video' | 'image' | null (null = genuinely
+     inconclusive, caller decides the default + swap eligibility). */
+  function detectMediaType(url) {
+    if (!url) return null;
+    var pathname = url, search = '';
+    try {
+      var base = (typeof window !== 'undefined' && window.location) ? window.location.href : undefined;
+      var u = new URL(url, base);
+      pathname = u.pathname || '';
+      search = u.search || '';
+    } catch (_) {
+      /* Not a parseable absolute URL (unusual blob:/data: form) — fall
+         through to testing the raw string below. */
+    }
+
+    if (VIDEO_EXT_RE.test(pathname)) return 'video';
+    if (IMAGE_EXT_RE.test(pathname)) return 'image';
+
+    if (search) {
+      try {
+        var params = new URLSearchParams(search);
+        var i, raw, mime;
+        for (i = 0; i < S3_CONTENT_TYPE_PARAMS.length; i++) {
+          raw = params.get(S3_CONTENT_TYPE_PARAMS[i]);
+          if (!raw) continue;
+          mime = decodeURIComponent(raw).toLowerCase();
+          if (mime.indexOf('video/') === 0) return 'video';
+          if (mime.indexOf('image/') === 0) return 'image';
+        }
+        var j, fnRaw, fn;
+        for (j = 0; j < S3_FILENAME_PARAMS.length; j++) {
+          fnRaw = params.get(S3_FILENAME_PARAMS[j]);
+          if (!fnRaw) continue;
+          fn = decodeURIComponent(fnRaw);
+          if (VIDEO_EXT_RE.test(fn)) return 'video';
+          if (IMAGE_EXT_RE.test(fn)) return 'image';
+        }
+      } catch (_) { /* malformed query string — ignore, stay inconclusive */ }
+    }
+
+    if (pathname === url) {
+      /* URL() couldn't parse this scheme at all — last resort, test the
+         whole raw string. */
+      if (VIDEO_EXT_RE.test(url)) return 'video';
+      if (IMAGE_EXT_RE.test(url)) return 'image';
+    }
+    return null;
+  }
+
+  /* True only when the type came from a real extension or an explicit
+     MIME/filename hint — never from a coin-flip guess. Gates the
+     one-time swap-on-error fallback in ImageCard/VideoCard. */
+  function isConfidentMediaType(url) {
+    return !!detectMediaType(url);
+  }
 
   function getMediaType(url) {
     if (!url) return 'image';
     if (State.videoOverrides.has(url)) return 'video';
     if (State.imageOverrides.has(url)) return 'image';
+    var detected = detectMediaType(url);
+    if (detected) return detected;
+    /* Genuinely inconclusive (no extension, no MIME/filename hint yet).
+       This app started life as an image gallery and most extensionless
+       S3 keys in practice are images, so default there. Crucially this
+       guess is NOT recorded as an override, so a later confident signal
+       (the background probe below, or a single onerror swap) can still
+       correct it without a fight. */
+    return 'image';
+  }
 
-    if (VIDEO_EXT_RE.test(url)) return 'video';
-    if (IMAGE_EXT_RE.test(url)) return 'image';
+  /* Rebuild the card in slot `idx` as `type`, but only if that slot is
+     currently mounted and hasn't already finished loading successfully
+     — used by the background probe below to correct an inconclusive
+     guess in place without disturbing media that's already fine. */
+  function swapCardType(idx, type) {
+    var slot = State.slots[idx];
+    if (!slot || !State.activeSet.has(slot)) return;
+    var card = slot.querySelector('.card');
+    if (!card || card.dataset.mediaStatus === MEDIA_STATUS.LOADED) return;
+    var wantsVideo = type === 'video';
+    var isVideo = card.classList.contains('card-video-card');
+    if (wantsVideo === isVideo) return;
+    var box = card.querySelector('.card-img-box');
+    if (box && box._destroy) box._destroy();
+    State.activeSet.delete(slot);
+    slot.innerHTML = '';
+    slot.appendChild(wantsVideo ? VideoCard.build(idx) : ImageCard.build(idx));
+    State.activeSet.add(slot);
+  }
 
-    var lower = url.toLowerCase();
-    if (lower.indexOf('video') !== -1 || lower.indexOf('mp4') !== -1 || lower.indexOf('webm') !== -1 || lower.indexOf('mkv') !== -1 || lower.indexOf('mov') !== -1) {
-      return 'video';
-    }
-    if (lower.indexOf('image') !== -1 || lower.indexOf('jpg') !== -1 || lower.indexOf('jpeg') !== -1 || lower.indexOf('png') !== -1 || lower.indexOf('gif') !== -1 || lower.indexOf('webp') !== -1) {
-      return 'image';
-    }
+  /* ────────────────────────────────────────────────────────
+     BACKGROUND CONTENT-TYPE PROBE (best effort, S3-aware)
 
-    return 'video';
+     For URLs where detectMediaType() above is genuinely inconclusive,
+     ask S3 directly via a lightweight HEAD request and read the real
+     Content-Type header instead of leaving it to chance. Fully
+     best-effort: if the bucket has no CORS policy allowing HEAD, or
+     the request stalls, we just time out quietly and keep relying on
+     the existing one-time swap-on-error fallback — no error is ever
+     surfaced to the user and rendering is never blocked on this.
+  ════════════════════════════════════════════════════════ */
+  var _probedUrls = new Set();
+  function probeContentType(idx, url) {
+    if (_probedUrls.has(url)) return;
+    _probedUrls.add(url);
+    if (typeof fetch !== 'function') return;
+
+    var ac = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+    var tid = setTimeout(function () { if (ac) ac.abort(); }, 6000);
+
+    fetch(url, { method: 'HEAD', cache: 'force-cache', signal: ac ? ac.signal : undefined })
+      .then(function (res) {
+        clearTimeout(tid);
+        var ct = res && res.headers && res.headers.get && res.headers.get('content-type');
+        if (!ct) return;
+        ct = ct.toLowerCase();
+        var type = null;
+        if (ct.indexOf('video/') === 0) type = 'video';
+        else if (ct.indexOf('image/') === 0) type = 'image';
+        if (!type) return;
+        if (type === 'video') { State.imageOverrides.delete(url); State.videoOverrides.add(url); }
+        else                  { State.videoOverrides.delete(url); State.imageOverrides.add(url); }
+        if (State.allUrls[idx] === url) swapCardType(idx, type);
+      })
+      .catch(function () { clearTimeout(tid); /* CORS/network/timeout — silently keep current guess */ });
   }
 
   function parseUrls(txt) {
@@ -642,6 +788,9 @@
       State.activeSet.add(slot);
       slot.innerHTML = '';
       var url = State.allUrls[i];
+      if (!State.videoOverrides.has(url) && !State.imageOverrides.has(url) && !isConfidentMediaType(url)) {
+        probeContentType(i, url);
+      }
       slot.appendChild(
         getMediaType(url) === 'video' ? VideoCard.build(i) : ImageCard.build(i)
       );
@@ -1055,7 +1204,16 @@
       });
       on(img, 'error', function () {
         if (suppressErrors) return;
-        if (!State.videoOverrides.has(url) && !State.imageOverrides.has(url)) {
+        /* Only reclassify as a video when the original type guess was
+           low-confidence (no real extension/MIME hint) AND we haven't
+           already tried the other tag once for this URL. A confidently
+           typed image (real .jpg/.png/etc, or an S3 content-type hint)
+           that fails to load is a genuine network/S3 failure, not a
+           wrong-type guess — it goes straight to the normal failed/
+           retry flow instead of being bounced to VideoCard, where a
+           transient hiccup used to get it permanently stuck mislabeled. */
+        var alreadyTried = State.videoOverrides.has(url) || State.imageOverrides.has(url);
+        if (!alreadyTried && !isConfidentMediaType(url)) {
           State.videoOverrides.add(url);
           var parentSlot = card.closest('.vslot');
           if (parentSlot) {
@@ -1235,15 +1393,23 @@
 
         var wait = waitForMediaRetry(url);
         setTimeout(function () {
-          State.videoOverrides.delete(url);
-          State.imageOverrides.delete(url);
           var parentSlot = card.closest('.vslot');
           if (parentSlot) {
             if (box._destroy) box._destroy();
             var idx = parseInt(parentSlot.dataset.idx, 10);
             State.activeSet.delete(parentSlot);
             parentSlot.innerHTML = '';
-            parentSlot.appendChild(VideoCard.build(idx));
+            /* Rebuild honoring the currently-known type (getMediaType)
+               instead of always forcing VideoCard. Previously this
+               cleared both override sets and rebuilt as VideoCard
+               unconditionally, which threw away a confirmed type on
+               every retry click and let a stubbornly-broken video
+               bounce back and forth between "Video" and "Image" on
+               repeated retries instead of just retrying as a video. */
+            var freshUrl = State.allUrls[idx];
+            parentSlot.appendChild(
+              getMediaType(freshUrl) === 'video' ? VideoCard.build(idx) : ImageCard.build(idx)
+            );
             State.activeSet.add(parentSlot);
           } else {
             retryInFlight = false;
@@ -1292,7 +1458,11 @@
       on(video, 'error', function () {
         if (suppressErrors) return;
         if (errored) return;
-        if (!State.imageOverrides.has(url) && !State.videoOverrides.has(url)) {
+        /* Same confidence gate as ImageCard's onerror — see there for
+           the full rationale. A confidently-typed video that fails to
+           load is a real network/S3 failure, not a wrong-type guess. */
+        var alreadyTried = State.imageOverrides.has(url) || State.videoOverrides.has(url);
+        if (!alreadyTried && !isConfidentMediaType(url)) {
           State.imageOverrides.add(url);
           var parentSlot = card.closest('.vslot');
           if (parentSlot) {
@@ -1638,94 +1808,76 @@
   }, { passive: true });
 
   /* ════════════════════════════════════════════════════════
-     VIEWPORT-WINDOW FAILED MEDIA RETRY
+     FAILED MEDIA RETRY (whole gallery)
   ════════════════════════════════════════════════════════ */
-  (function RetryVisibleFailed() {
+  (function RetryFailedMedia() {
     var running = false;
-    var WINDOW_SIZE = 20;
 
-    function visibleAnchorIndex() {
-      var bestIdx = -1;
-      var bestTop = Infinity;
-      State.slots.forEach(function (slot) {
-        if (!isOnScreen(slot)) return;
-        var idx = parseInt(slot.dataset.idx, 10);
-        if (!isFinite(idx)) return;
-        var top = slot.getBoundingClientRect().top;
-        if (top >= 0 && top < bestTop) {
-          bestTop = top;
-          bestIdx = idx;
-        }
-      });
-      if (bestIdx !== -1) return bestIdx;
-
-      State.slots.forEach(function (slot) {
-        if (!isOnScreen(slot)) return;
-        var idx = parseInt(slot.dataset.idx, 10);
-        if (bestIdx === -1 || idx < bestIdx) bestIdx = idx;
-      });
-      return bestIdx;
-    }
-
+    /* Collect every FAILED url across the whole gallery — not just a
+       small window near the current scroll position. Slots that are
+       currently mounted (State.activeSet) are retried for real, right
+       now, with bounded concurrency exactly like before. Off-screen
+       slots are deliberately NOT force-mounted: building live
+       <img>/<video> elements (and opening real S3 connections) for up
+       to 1,000 items at once would blow past the ~30-80 live-node
+       budget the virtual scroller is built around. Instead their
+       failed state is cleared so the moment they scroll into view they
+       attempt a fresh load instead of immediately showing "failed"
+       again — so every failed item genuinely gets retried, either
+       immediately (if mounted) or on next scroll-into-view (if not),
+       and performance stays exactly as before. */
     function collect() {
-      var tasks = [];
-      var anchor = visibleAnchorIndex();
-      if (anchor < 0) return tasks;
-
-      var end = Math.min(State.slots.length, anchor + WINDOW_SIZE);
-      for (var idx = anchor; idx < end; idx++) {
+      var activeTasks = [];
+      var queuedCount = 0;
+      for (var idx = 0; idx < State.slots.length; idx++) {
         var slot = State.slots[idx];
         var url = State.allUrls[idx];
         if (!slot || !url) continue;
 
         var mediaState = MediaState.get(url);
         if (mediaState.status !== MEDIA_STATUS.FAILED) continue;
-        if (!MediaState.canRetry(url)) continue;
 
-        if (!State.activeSet.has(slot)) Virtual.activate(slot);
-        var card = slot.querySelector('.card');
-        if (!card || typeof card._retryMedia !== 'function') continue;
-        tasks.push({ url: url, card: card });
+        if (State.activeSet.has(slot)) {
+          var card = slot.querySelector('.card');
+          if (card && typeof card._retryMedia === 'function') {
+            mediaState.retryCount = 0;
+            activeTasks.push({ url: url, card: card });
+            continue;
+          }
+        }
+        /* Off-screen (or missing its card for some reason) — reset so
+           the next activation attempts a fresh load instead of
+           re-showing the stale failed view. */
+        mediaState.status = null;
+        mediaState.retryCount = 0;
+        queuedCount++;
       }
-      return tasks;
+      return { activeTasks: activeTasks, queuedCount: queuedCount };
     }
 
-    function runQueue(tasks) {
-      var next = 0;
-      var done = 0;
-      var ok = 0;
-      var finished = false;
-
-      function finish() {
-        if (finished) return;
-        finished = true;
-        running = false;
-        DOM.retryVisibleFailedBtn.disabled = false;
-        DOM.retryVisibleFailedBtn.innerHTML = '&#8634; Retry';
-        Toast.show('Retried ' + done + ' failed media item' +
-          (done !== 1 ? 's' : '') + (ok ? '; ' + ok + ' recovered.' : '.'), ok ? 'ok' : 'err', 3200);
-      }
+    function runQueue(tasks, onDone) {
+      var next = 0, done = 0, ok = 0;
 
       function launch() {
         if (next >= tasks.length) {
-          if (done >= tasks.length) finish();
+          if (done >= tasks.length) onDone(done, ok);
           return;
         }
-
         var task = tasks[next++];
-        Promise.resolve(task.card._retryMedia(false, true))
+        /* applyLimit=false — an explicit "Retry" click is a deliberate,
+           whole-gallery user action, so every failed item gets a fresh
+           attempt regardless of any earlier automatic-retry cap. */
+        Promise.resolve(task.card._retryMedia(false, false))
           .then(function (success) { if (success) ok++; })
           .catch(function () {})
           .then(function () {
             done++;
-            if (done >= tasks.length) {
-              finish();
-            } else {
-              setTimeout(launch, RETRY_CONFIG.delayMs);
-            }
+            if (done >= tasks.length) onDone(done, ok);
+            else setTimeout(launch, RETRY_CONFIG.delayMs);
           });
       }
 
+      if (!tasks.length) { onDone(0, 0); return; }
       for (var i = 0; i < RETRY_CONFIG.concurrency && i < tasks.length; i++) {
         setTimeout(launch, i * RETRY_CONFIG.delayMs);
       }
@@ -1733,17 +1885,34 @@
 
     on(DOM.retryVisibleFailedBtn, 'click', function () {
       if (running) return;
-      var tasks = collect();
-      if (!tasks.length) {
-        Toast.show('No failed media in the current 20-item window.', 'ok', 2200);
+      var collected = collect();
+      var activeTasks = collected.activeTasks;
+      var queuedCount = collected.queuedCount;
+
+      if (!activeTasks.length && !queuedCount) {
+        Toast.show('No failed media to retry.', 'ok', 2200);
         return;
       }
+
       running = true;
       DOM.retryVisibleFailedBtn.disabled = true;
       DOM.retryVisibleFailedBtn.textContent = 'Retrying...';
-      Toast.show('Retrying ' + tasks.length + ' failed media item' +
-        (tasks.length !== 1 ? 's' : '') + ' with limited concurrency.', 'ok', 2600);
-      runQueue(tasks);
+
+      var startParts = [];
+      if (activeTasks.length) startParts.push('retrying ' + activeTasks.length + ' now');
+      if (queuedCount) startParts.push(queuedCount + ' more queued to reload on scroll');
+      Toast.show('Failed media \u2014 ' + startParts.join(', ') + '.', 'ok', 2800);
+
+      runQueue(activeTasks, function (done, ok) {
+        running = false;
+        DOM.retryVisibleFailedBtn.disabled = false;
+        DOM.retryVisibleFailedBtn.innerHTML = '&#8634; Retry';
+        var parts = [];
+        if (done) parts.push(done + ' retried' + (ok ? ' (' + ok + ' recovered)' : ''));
+        if (queuedCount) parts.push(queuedCount + ' queued for scroll-in');
+        var msg = parts.length ? parts.join('; ') + '.' : 'Nothing left to retry.';
+        Toast.show(msg, (ok || queuedCount) ? 'ok' : 'err', 3200);
+      });
     });
   })();
 
