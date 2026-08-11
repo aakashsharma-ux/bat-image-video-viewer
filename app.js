@@ -35,6 +35,13 @@
       return n;
     }
     function on(t, type, fn, opts) { t.addEventListener(type, fn, opts || false); }
+    /* Fully release a <video>'s network/decoder resources. Safe to call
+       even if the element has no src or is mid-teardown. */
+    function unloadVideo(v) {
+      try { v.pause(); } catch (_) {}
+      v.removeAttribute('src');
+      try { v.load(); } catch (_) {}
+    }
     function stop(e) { e.stopPropagation(); }
     function isTyping() {
       var a = document.activeElement;
@@ -81,7 +88,8 @@
     }
     return {
       $: $, el: el, on: on, stop: stop, isTyping: isTyping,
-      clamp: clamp, fmtTime: fmtTime, copyToClipboard: copyToClipboard
+      clamp: clamp, fmtTime: fmtTime, copyToClipboard: copyToClipboard,
+      unloadVideo: unloadVideo
     };
   })();
 
@@ -112,7 +120,6 @@
     scrollSpeed  : $('scrollSpeed'),
     scrollBadge  : $('scrollBadge'),
     zoomEnabled           : $('zoomEnabled'),
-    fastImageProcessing   : $('fastImageProcessing'),
     retryVisibleFailedBtn : $('retryVisibleFailedBtn'),
     themeToggle           : $('themeToggle'),
     themeLabel   : $('themeLabel'),
@@ -195,6 +202,14 @@
     canRetry: function (url) {
       return MediaState.get(url).retryCount < RETRY_CONFIG.maxRetries;
     },
+    /* Base delay, plus an escalating backoff once beginRetry(url, type, true)
+       has bumped retryCount (automatic/limited retries only). Shared formula
+       — was duplicated identically in ImageCard.retryImage and
+       VideoCard.retryVideo. */
+    retryDelay: function (url, applyLimit) {
+      return RETRY_CONFIG.delayMs + (applyLimit === true
+        ? (MediaState.get(url).retryCount - 1) * RETRY_CONFIG.backoffMs : 0);
+    },
     clear: function () {
       State.mediaStates = Object.create(null);
     },
@@ -231,15 +246,6 @@
     });
     spin.appendChild(retryBtn);
     return spin;
-  }
-
-  function isOnScreen(node) {
-    if (!node || !node.getBoundingClientRect) return false;
-    var r = node.getBoundingClientRect();
-    var vw = window.innerWidth || document.documentElement.clientWidth;
-    var vh = window.innerHeight || document.documentElement.clientHeight;
-    return r.width > 0 && r.height > 0 && r.bottom > 0 && r.right > 0 &&
-           r.top < vh && r.left < vw;
   }
 
   function waitForMediaRetry(url) {
@@ -466,10 +472,42 @@
     if (wantsVideo === isVideo) return;
     var box = card.querySelector('.card-img-box');
     if (box && box._destroy) box._destroy();
-    State.activeSet.delete(slot);
-    slot.innerHTML = '';
-    slot.appendChild(wantsVideo ? VideoCard.build(idx) : ImageCard.build(idx));
-    State.activeSet.add(slot);
+    Virtual.rebuildSlot(slot, idx, wantsVideo ? VideoCard.build : ImageCard.build);
+  }
+
+  /* Shared by ImageCard/VideoCard onerror handlers: when a media
+     element fails and its type was only ever a low-confidence guess
+     (no real extension/MIME hint) AND the other type hasn't already
+     been tried for this URL, swap the card to the other media type
+     once instead of giving up immediately. A confidently-typed URL
+     that fails is a genuine network/S3 failure and this is skipped,
+     going straight to the normal failed/retry flow instead. Returns
+     true if a swap was performed (caller should stop there). */
+  function trySwapMediaType(url, card, box, zoom, overrideSet, buildOther) {
+    var alreadyTried = State.videoOverrides.has(url) || State.imageOverrides.has(url);
+    if (alreadyTried || isConfidentMediaType(url)) return false;
+    var parentSlot = card.closest('.vslot');
+    if (!parentSlot) return false;
+    overrideSet.add(url);
+    if (box._destroy) box._destroy(); else zoom.destroy();
+    Virtual.rebuildSlot(parentSlot, parseInt(parentSlot.dataset.idx, 10), buildOther);
+    return true;
+  }
+
+  /* Shared retry-guard for ImageCard.retryImage / VideoCard.retryVideo:
+     returns false (after showing a toast, if the retry cap was hit) when
+     the retry should NOT proceed; otherwise marks the card LOADING and
+     begins tracking the attempt in MediaState. Callers still own their
+     own `retryInFlight` closure flag and any type-specific teardown. */
+  function beginCardRetry(url, type, card, fromLoading, applyLimit) {
+    var current = MediaState.get(url);
+    if (!fromLoading && current.status !== MEDIA_STATUS.FAILED) return false;
+    if (!MediaState.beginRetry(url, type, applyLimit === true)) {
+      Toast.show('Maximum retries reached for this media.', 'err', 2600);
+      return false;
+    }
+    card.dataset.mediaStatus = MEDIA_STATUS.LOADING;
+    return true;
   }
 
   /* ────────────────────────────────────────────────────────
@@ -678,6 +716,19 @@
       return b;
     }
 
+    /* Shared "\u26a0 Could not load ..." panel + Retry button, used by both
+       ImageCard and VideoCard failed states (previously duplicated). */
+    function buildErrorView(box, message, url, onRetryClick) {
+      var errDiv = el('div', 'card-err');
+      errDiv.innerHTML = '\u26a0 ' + message + '<br>' +
+        '<small style="opacity:.4;word-break:break-all;">' + url + '</small>';
+      var retryBtn = makeBtn('card-retry-btn', '\u21ba Retry');
+      on(retryBtn, 'click', onRetryClick);
+      errDiv.appendChild(retryBtn);
+      box.appendChild(errDiv);
+      return errDiv;
+    }
+
     /* Builds Copy/Edit/Remove toolbar.
        opts: { url, onCopyLink, onEdit, onRemove } */
     function toolbar(opts) {
@@ -762,7 +813,21 @@
       }, 230);
     }
 
-    return { header: header, urlRow: urlRow, toolbar: toolbar, removeCard: removeCard };
+    /* Zoom badge + hint overlay — identical in ImageCard and VideoCard.
+       Returns both elements (ImageCard also needs `hint` to show/hide
+       it during loading-state transitions; VideoCard only needs badge). */
+    function zoomOverlay(box) {
+      var badge = el('div', 'zoom-badge');
+      var hint  = el('div', 'zoom-hint');
+      hint.textContent = 'Scroll\u2022zoom    Drag\u2022pan    Dbl-click\u2022reset';
+      box.appendChild(badge); box.appendChild(hint);
+      return { badge: badge, hint: hint };
+    }
+
+    return {
+      header: header, urlRow: urlRow, toolbar: toolbar, removeCard: removeCard,
+      makeBtn: makeBtn, buildErrorView: buildErrorView, zoomOverlay: zoomOverlay
+    };
   })();
 
   /* ════════════════════════════════════════════════════════
@@ -795,43 +860,51 @@
         getMediaType(url) === 'video' ? VideoCard.build(i) : ImageCard.build(i)
       );
     }
+    /* Tear down whatever card currently occupies `slot` and replace it
+       with buildFn(idx), keeping State.activeSet accounting correct.
+       Shared by swapCardType, the video retry path, and the image<->video
+       onerror fallback (trySwapMediaType) — previously each repeated the
+       delete/clear/build/re-add sequence inline. */
+    function rebuildSlot(slot, idx, buildFn) {
+      State.activeSet.delete(slot);
+      slot.innerHTML = '';
+      slot.appendChild(buildFn(idx));
+      State.activeSet.add(slot);
+    }
     function deactivate(slot) {
       if (!State.activeSet.has(slot)) return;
       State.activeSet.delete(slot);
       var box = slot.querySelector('.card-img-box');
       if (box && box._destroy) box._destroy();
       slot.querySelectorAll('img').forEach(function (img) { img.src = ''; });
-      slot.querySelectorAll('video').forEach(function (v) {
-        try { v.pause(); } catch (_) {}
-        v.removeAttribute('src');
-        try { v.load(); } catch (_) {}
-      });
+      slot.querySelectorAll('video').forEach(Util.unloadVideo);
       slot.innerHTML = '';
       var i = parseInt(slot.dataset.idx, 10);
       if (i < State.allUrls.length) slot.appendChild(makeUrlLabel(State.allUrls[i]));
     }
     function rebuildObserver() {
       if (State.observer) State.observer.disconnect();
-      /* Keep only ~0.5 screen of cards hot above/below the viewport so we
-         scale to 1,000+ media items without exhausting memory or sockets.
-         Inactive slots fully unload their <video src> in deactivate(). */
+      /* Keep ~2 screens of cards hot above/below the viewport so media has
+         time to finish downloading before it actually scrolls into view —
+         at normal scroll speed this makes loading feel instant instead of
+         showing a spinner on every newly-revealed row. Still bounded (not
+         "load everything") so we keep scaling to 1,000+ media items
+         without exhausting memory or sockets. Inactive slots fully unload
+         their <video src> in deactivate() once they scroll back out of
+         this window. */
       State.observer = new IntersectionObserver(function (entries) {
         entries.forEach(function (e) {
           if (e.isIntersecting) activate(e.target);
           else                  deactivate(e.target);
         });
-      }, { root: null, rootMargin: '50% 0px 50% 0px', threshold: 0 });
+      }, { root: null, rootMargin: '200% 0px 200% 0px', threshold: 0 });
       State.slots.forEach(function (s) { State.observer.observe(s); });
     }
     function clear() {
       if (State.observer) { State.observer.disconnect(); State.observer = null; }
       if (EditMode.isActive()) EditMode.exit(false);
       DOM.gallery.querySelectorAll('img').forEach(function (img) { img.src = ''; });
-      DOM.gallery.querySelectorAll('video').forEach(function (v) {
-        try { v.pause(); } catch (_) {}
-        v.removeAttribute('src');
-        try { v.load(); } catch (_) {}
-      });
+      DOM.gallery.querySelectorAll('video').forEach(Util.unloadVideo);
       DOM.gallery.innerHTML = '';
       State.allUrls = []; State.slots = []; State.activeSet = new Set();
       State.videoOverrides.clear();
@@ -858,99 +931,8 @@
     }
     return {
       makeSlot: makeSlot, activate: activate, rebuildObserver: rebuildObserver,
-      clear: clear, appendUrls: appendUrls
+      clear: clear, appendUrls: appendUrls, rebuildSlot: rebuildSlot
     };
-  })();
-
-  /* ════════════════════════════════════════════════════════
-     PROGRESSIVE LOAD
-
-     When the "Fast Image Processing" toggle is on, only the
-     first 100 slots are placed into the DOM on load.  A thin
-     sentinel <div> is appended after them.  An IntersectionObserver
-     watches the sentinel; as soon as it enters the viewport
-     (with a 400 px look-ahead margin) the next 100 URLs are
-     handed to Virtual.appendUrls, then the sentinel is moved
-     back to the bottom — repeat until the queue is empty.
-
-     All previously loaded slots stay in the DOM and in memory;
-     nothing is unloaded.  The existing Virtual observer keeps
-     handling lazy content-activation as usual.
-  ════════════════════════════════════════════════════════ */
-  var ProgressiveLoad = (function () {
-    var BATCH     = 100;
-    var _pending  = [];    /* URLs not yet rendered */
-    var _sentinel = null;  /* trigger element anchored at gallery end */
-    var _sentObs  = null;  /* dedicated observer for the sentinel */
-    var _busy     = false; /* guard: prevent double-fire on one frame */
-
-    function _removeSentinel() {
-      if (_sentObs)  { _sentObs.disconnect();  _sentObs  = null; }
-      if (_sentinel) { _sentinel.remove();     _sentinel = null; }
-    }
-
-    function _loadBatch() {
-      /* Double-fire guard and empty-queue check */
-      if (_busy) return;
-      if (!_pending.length) { _removeSentinel(); return; }
-
-      _busy = true;
-
-      var batch  = _pending.slice(0, BATCH);
-      _pending   = _pending.slice(BATCH);
-
-      /* appendUrls adds batch to State.allUrls, builds slots,
-         appends them to DOM.gallery (currently after sentinel),
-         and observes each new slot with the Virtual observer. */
-      Virtual.appendUrls(batch);
-
-      /* Move sentinel back to the very end so it stays below
-         the freshly added slots and triggers the next batch. */
-      if (_sentinel && _sentinel.parentNode) {
-        DOM.gallery.appendChild(_sentinel);
-      }
-
-      /* No more URLs — tear down */
-      if (!_pending.length) _removeSentinel();
-
-      _busy = false;
-    }
-
-    function _makeSentinel() {
-      _sentinel = document.createElement('div');
-      _sentinel.className  = 'pl-sentinel';
-      _sentinel.setAttribute('aria-hidden', 'true');
-      DOM.gallery.appendChild(_sentinel);
-
-      _sentObs = new IntersectionObserver(function (entries) {
-        entries.forEach(function (e) { if (e.isIntersecting) _loadBatch(); });
-      }, { root: null, rootMargin: '400px 0px', threshold: 0 });
-
-      _sentObs.observe(_sentinel);
-    }
-
-    /* Public: kick off a progressive session with the full URL list. */
-    function start(urls) {
-      _removeSentinel();
-      _busy    = false;
-      var first = urls.slice(0, BATCH);
-      _pending  = urls.slice(BATCH);
-      Virtual.appendUrls(first);            /* renders first 100 slots  */
-      if (_pending.length) _makeSentinel(); /* arms the scroll trigger   */
-    }
-
-    /* Public: discard pending queue and remove the sentinel. */
-    function clear() {
-      _removeSentinel();
-      _pending = [];
-      _busy    = false;
-    }
-
-    function isEnabled() {
-      return !!(DOM.fastImageProcessing && DOM.fastImageProcessing.checked);
-    }
-
-    return { start: start, clear: clear, isEnabled: isEnabled };
   })();
 
   /* ════════════════════════════════════════════════════════
@@ -1159,30 +1141,15 @@
         syncCardStatus(MEDIA_STATUS.FAILED);
         if (resolvePending) resolveRetry(false);
         if (errDiv && errDiv.parentNode) return;
-        errDiv = el('div', 'card-err');
-        errDiv.innerHTML = '\u26a0 Could not load<br>' +
-          '<small style="opacity:.4;word-break:break-all;">' + url + '</small>';
-        var retryBtn = el('button', 'card-retry-btn');
-        retryBtn.textContent = '\u21ba Retry';
-        on(retryBtn, 'click', function () {
+        errDiv = Chrome.buildErrorView(box, 'Could not load', url, function () {
           retryImage(false);
         });
-        errDiv.appendChild(retryBtn);
-        box.appendChild(errDiv);
       }
 
       function retryImage(fromLoading, applyLimit) {
         if (retryInFlight) return Promise.resolve(false);
-        var current = MediaState.get(url);
-        if (!fromLoading && current.status !== MEDIA_STATUS.FAILED) {
-          return Promise.resolve(false);
-        }
-        if (!MediaState.beginRetry(url, 'image', applyLimit === true)) {
-          Toast.show('Maximum retries reached for this media.', 'err', 2600);
-          return Promise.resolve(false);
-        }
+        if (!beginCardRetry(url, 'image', card, fromLoading, applyLimit)) return Promise.resolve(false);
         retryInFlight = true;
-        card.dataset.mediaStatus = MEDIA_STATUS.LOADING;
         cancelImageRequest();
         restoreLoadingView();
         syncCardStatus(MEDIA_STATUS.LOADING);
@@ -1191,7 +1158,7 @@
           setTimeout(function () {
             suppressErrors = false;
             img.src = url;
-          }, RETRY_CONFIG.delayMs + (applyLimit === true ? (MediaState.get(url).retryCount - 1) * RETRY_CONFIG.backoffMs : 0));
+          }, MediaState.retryDelay(url, applyLimit));
         });
       }
 
@@ -1204,39 +1171,17 @@
       });
       on(img, 'error', function () {
         if (suppressErrors) return;
-        /* Only reclassify as a video when the original type guess was
-           low-confidence (no real extension/MIME hint) AND we haven't
-           already tried the other tag once for this URL. A confidently
-           typed image (real .jpg/.png/etc, or an S3 content-type hint)
-           that fails to load is a genuine network/S3 failure, not a
-           wrong-type guess — it goes straight to the normal failed/
-           retry flow instead of being bounced to VideoCard, where a
-           transient hiccup used to get it permanently stuck mislabeled. */
-        var alreadyTried = State.videoOverrides.has(url) || State.imageOverrides.has(url);
-        if (!alreadyTried && !isConfidentMediaType(url)) {
-          State.videoOverrides.add(url);
-          var parentSlot = card.closest('.vslot');
-          if (parentSlot) {
-            if (box._destroy) box._destroy();
-            else zoom.destroy();
-            var idx = parseInt(parentSlot.dataset.idx, 10);
-            State.activeSet.delete(parentSlot);
-            parentSlot.innerHTML = '';
-            parentSlot.appendChild(VideoCard.build(idx));
-            State.activeSet.add(parentSlot);
-            return;
-          }
-        }
+        /* See trySwapMediaType: a low-confidence type guess gets one
+           shot at the other media type before we call it a real failure. */
+        if (trySwapMediaType(url, card, box, zoom, State.videoOverrides, VideoCard.build)) return;
         showFailedView(true);
       });
       rotateWrap.appendChild(img);
       box.appendChild(rotateWrap);
 
-      /* Zoom overlays */
-      var badge = el('div', 'zoom-badge');
-      var hint  = el('div', 'zoom-hint');
-      hint.textContent = 'Scroll\u2022zoom    Drag\u2022pan    Dbl-click\u2022reset';
-      box.appendChild(badge); box.appendChild(hint);
+      /* Zoom overlay (badge + hint) */
+      var overlay = Chrome.zoomOverlay(box);
+      var badge = overlay.badge, hint = overlay.hint;
 
       var zoom = attachZoom(card, box, img, badge);
       box._retryMedia = retryImage;
@@ -1326,10 +1271,7 @@
       }
 
       /* Zoom badge + hint — same overlay elements as ImageCard */
-      var badge = el('div', 'zoom-badge');
-      var hint  = el('div', 'zoom-hint');
-      hint.textContent = 'Scroll\u2022zoom    Drag\u2022pan    Dbl-click\u2022reset';
-      box.appendChild(badge); box.appendChild(hint);
+      var badge = Chrome.zoomOverlay(box).badge;
 
       /* Attach scroll-wheel zoom identical to image zoom */
       video.style.transformOrigin = '0 0';
@@ -1372,20 +1314,10 @@
 
       function retryVideo(fromLoading, applyLimit) {
         if (retryInFlight) return Promise.resolve(false);
-        var current = MediaState.get(url);
-        if (!fromLoading && current.status !== MEDIA_STATUS.FAILED) {
-          return Promise.resolve(false);
-        }
-        if (!MediaState.beginRetry(url, 'video', applyLimit === true)) {
-          Toast.show('Maximum retries reached for this media.', 'err', 2600);
-          return Promise.resolve(false);
-        }
+        if (!beginCardRetry(url, 'video', card, fromLoading, applyLimit)) return Promise.resolve(false);
         retryInFlight = true;
-        card.dataset.mediaStatus = MEDIA_STATUS.LOADING;
         suppressErrors = true;
-        try { video.pause(); } catch (_) {}
-        video.removeAttribute('src');
-        try { video.load(); } catch (_) {}
+        Util.unloadVideo(video);
         syncCardStatus(MEDIA_STATUS.LOADING);
         box.innerHTML = '';
         spin = makeLoadingSpinner(function () { retryVideo(true); });
@@ -1397,8 +1329,6 @@
           if (parentSlot) {
             if (box._destroy) box._destroy();
             var idx = parseInt(parentSlot.dataset.idx, 10);
-            State.activeSet.delete(parentSlot);
-            parentSlot.innerHTML = '';
             /* Rebuild honoring the currently-known type (getMediaType)
                instead of always forcing VideoCard. Previously this
                cleared both override sets and rebuilt as VideoCard
@@ -1407,15 +1337,14 @@
                bounce back and forth between "Video" and "Image" on
                repeated retries instead of just retrying as a video. */
             var freshUrl = State.allUrls[idx];
-            parentSlot.appendChild(
-              getMediaType(freshUrl) === 'video' ? VideoCard.build(idx) : ImageCard.build(idx)
-            );
-            State.activeSet.add(parentSlot);
+            Virtual.rebuildSlot(parentSlot, idx, function (i) {
+              return getMediaType(freshUrl) === 'video' ? VideoCard.build(i) : ImageCard.build(i);
+            });
           } else {
             retryInFlight = false;
             resolveMediaRetry(url, false);
           }
-        }, RETRY_CONFIG.delayMs + (applyLimit === true ? (MediaState.get(url).retryCount - 1) * RETRY_CONFIG.backoffMs : 0));
+        }, MediaState.retryDelay(url, applyLimit));
         return wait;
       }
 
@@ -1425,19 +1354,11 @@
         syncCardStatus(MEDIA_STATUS.FAILED);
         if (resolvePending) resolveMediaRetry(url, false);
         retryInFlight = false;
-        video.removeAttribute('src');
-        try { video.load(); } catch (_) {}
+        Util.unloadVideo(video);
         box.innerHTML = '';
-        var errDiv = el('div', 'card-err');
-        errDiv.innerHTML = '\u26a0 Could not load video<br>' +
-          '<small style="opacity:.4;word-break:break-all;">' + url + '</small>';
-        var retryBtn = el('button', 'card-retry-btn');
-        retryBtn.textContent = '\u21ba Retry';
-        on(retryBtn, 'click', function () {
+        Chrome.buildErrorView(box, 'Could not load video', url, function () {
           retryVideo(false);
         });
-        errDiv.appendChild(retryBtn);
-        box.appendChild(errDiv);
       }
 
       if (!startsFailed) syncCardStatus(MEDIA_STATUS.LOADING);
@@ -1458,24 +1379,8 @@
       on(video, 'error', function () {
         if (suppressErrors) return;
         if (errored) return;
-        /* Same confidence gate as ImageCard's onerror — see there for
-           the full rationale. A confidently-typed video that fails to
-           load is a real network/S3 failure, not a wrong-type guess. */
-        var alreadyTried = State.imageOverrides.has(url) || State.videoOverrides.has(url);
-        if (!alreadyTried && !isConfidentMediaType(url)) {
-          State.imageOverrides.add(url);
-          var parentSlot = card.closest('.vslot');
-          if (parentSlot) {
-            if (box._destroy) box._destroy();
-            else zoom.destroy();
-            var idx = parseInt(parentSlot.dataset.idx, 10);
-            State.activeSet.delete(parentSlot);
-            parentSlot.innerHTML = '';
-            parentSlot.appendChild(ImageCard.build(idx));
-            State.activeSet.add(parentSlot);
-            return;
-          }
-        }
+        /* Same confidence gate as ImageCard's onerror — see trySwapMediaType. */
+        if (trySwapMediaType(url, card, box, zoom, State.imageOverrides, ImageCard.build)) return;
         showFailedView(true);
       });
 
@@ -1635,31 +1540,15 @@
       });
     }
 
-    /* ── Hover preview ── */
-    function attachHoverPreview(box, video) {
-      var hover = false;
-      on(box, 'mouseenter', function () {
-        if (video._errored || video.readyState < 1) return;
-        if (video.paused && video.currentTime < (video.duration || 1) - 0.1) {
-          hover = true;
-          var p = video.play();
-          if (p && p.catch) p.catch(function () { hover = false; });
-        }
-      });
-      on(box, 'mouseleave', function () {
-        if (hover && !video.paused) { video.pause(); hover = false; }
-      });
-    }
-
     /* ── Controls bar (floating overlay) ──
        Returns { bar, onMetadata, onTimeUpdate, onRateChange, onVolumeChange, destroy } */
     function buildControls(video, box, url) {
       var bar = el('div', 'video-controls');
 
       /* Left cluster: frame step / play / frame step */
-      var prevBtn = mkBtn('vc-btn', '\u23EE', 'Previous frame (,)');
-      var playBtn = mkBtn('vc-btn vc-play', '\u25B6', 'Play / Pause (Space)');
-      var nextBtn = mkBtn('vc-btn', '\u23ED', 'Next frame (.)');
+      var prevBtn = Chrome.makeBtn('vc-btn', '\u23EE', 'Previous frame (,)');
+      var playBtn = Chrome.makeBtn('vc-btn vc-play', '\u25B6', 'Play / Pause (Space)');
+      var nextBtn = Chrome.makeBtn('vc-btn', '\u23ED', 'Next frame (.)');
 
       on(prevBtn, 'click', function (e) { e.stopPropagation();
         video.pause();
@@ -1702,7 +1591,7 @@
       speedBar.min = '0.25'; speedBar.max = '4'; speedBar.step = '0.05';
       speedBar.value = String(video.playbackRate || 1);
       speedBar.title = 'Playback speed';
-      var speedBtn = mkBtn('vc-btn vc-speed', '1\u00D7', 'Double-click to reset speed');
+      var speedBtn = Chrome.makeBtn('vc-btn vc-speed', '1\u00D7', 'Double-click to reset speed');
       on(speedBar, 'input', function (e) {
         e.stopPropagation();
         video.playbackRate = parseFloat(speedBar.value);
@@ -1717,7 +1606,7 @@
       speedWrap.appendChild(speedBtn);
 
       /* Mute / volume */
-      var muteBtn = mkBtn('vc-btn', '\uD83D\uDD0A', 'Mute (M)');
+      var muteBtn = Chrome.makeBtn('vc-btn', '\uD83D\uDD0A', 'Mute (M)');
       var volBar  = document.createElement('input');
       volBar.type = 'range'; volBar.className = 'vc-vol';
       volBar.min = '0'; volBar.max = '1'; volBar.step = '0.01';
@@ -1734,7 +1623,7 @@
       on(volBar, 'click', Util.stop);
 
       /* Snapshot — capture current frame as a new image entry */
-      var snapBtn = mkBtn('vc-btn vc-snap', '\uD83D\uDCF7', 'Capture frame as image');
+      var snapBtn = Chrome.makeBtn('vc-btn vc-snap', '\uD83D\uDCF7', 'Capture frame as image');
       on(snapBtn, 'click', function (e) {
         e.stopPropagation();
         try {
@@ -1752,7 +1641,7 @@
       });
 
       /* Fullscreen */
-      var fsBtn = mkBtn('vc-btn', '\u26F6', 'Fullscreen');
+      var fsBtn = Chrome.makeBtn('vc-btn', '\u26F6', 'Fullscreen');
       on(fsBtn, 'click', function (e) {
         e.stopPropagation();
         if (box.requestFullscreen) box.requestFullscreen();
@@ -1787,12 +1676,6 @@
       onRateChange(); onVolumeChange();
       return { bar: bar, onMetadata: onMetadata, onTimeUpdate: onTimeUpdate,
                onRateChange: onRateChange, onVolumeChange: onVolumeChange, destroy: destroy };
-    }
-
-    function mkBtn(cls, label, title) {
-      var b = el('button', cls); b.textContent = label;
-      if (title) b.title = title;
-      return b;
     }
 
     return { build: build };
@@ -2038,6 +1921,16 @@
   /* ════════════════════════════════════════════════════════
      BULK LOAD
   ════════════════════════════════════════════════════════ */
+  /* Shared tail of both bulk-load branches below: fade out the progress
+     bar, clear the input, and release the loading lock. */
+  function finishBulkLoadUI() {
+    setTimeout(function () { DOM.progWrap.classList.add('hide'); DOM.progFill.style.width = '0%'; }, 2400);
+    DOM.bulkArea.value = '';
+    DOM.bulkTally.innerHTML = '<b>0</b> URLs';
+    State.isLoading = false;
+    DOM.bulkLoadBtn.disabled = false;
+  }
+
   on(DOM.bulkLoadBtn, 'click', async function () {
     if (State.isLoading) return;
     var urls = parseUrls(DOM.bulkArea.value).filter(isValidUrl);
@@ -2047,38 +1940,10 @@
     DOM.bulkLoadBtn.disabled = true;
 
     if (!DOM.appendMode.checked) {
-      ProgressiveLoad.clear();
       Virtual.clear();
     }
 
-    /* ── PROGRESSIVE MODE ────────────────────────────────────────────
-       Render only the first 100 slots immediately; the rest are held
-       in the ProgressiveLoad queue and flushed 100 at a time via the
-       sentinel IntersectionObserver as the user scrolls.              */
-    if (ProgressiveLoad.isEnabled()) {
-      var firstN = Math.min(100, urls.length);
-
-      DOM.progWrap.classList.remove('hide');
-      DOM.progFill.style.width = String(Math.round((firstN / urls.length) * 100)) + '%';
-      DOM.progLabel.textContent = 'Queued ' + urls.length + ' items. Loading first ' + firstN + '\u2026';
-      await new Promise(function (r) { requestAnimationFrame(r); });
-
-      ProgressiveLoad.start(urls);
-
-      var pSummary = firstN + ' of ' + urls.length +
-                     ' item' + (urls.length !== 1 ? 's' : '') + ' loaded' +
-                     (urls.length > firstN ? ' \u2014 scroll down to load more.' : '.');
-      DOM.progLabel.textContent = firstN + ' / ' + urls.length + ' items ready!';
-      Toast.show(pSummary, 'ok', 4000);
-      setTimeout(function () { DOM.progWrap.classList.add('hide'); DOM.progFill.style.width = '0%'; }, 2400);
-      DOM.bulkArea.value = '';
-      DOM.bulkTally.innerHTML = '<b>0</b> URLs';
-      State.isLoading = false;
-      DOM.bulkLoadBtn.disabled = false;
-      return;
-    }
-
-    /* ── STANDARD MODE (unchanged) ───────────────────────────────── */
+    /* ── Build slots for every URL, in chunks so the UI stays responsive ── */
     var startIdx = State.allUrls.length;
     State.allUrls = State.allUrls.concat(urls);
 
@@ -2113,11 +1978,7 @@
                           ', ' + nVid + ' video' + (nVid !== 1 ? 's' : '') + ')' : '') + '.';
     DOM.progLabel.textContent = urls.length + ' items ready!';
     Toast.show(summary, 'ok', 4000);
-    setTimeout(function () { DOM.progWrap.classList.add('hide'); DOM.progFill.style.width = '0%'; }, 2400);
-    DOM.bulkArea.value = '';
-    DOM.bulkTally.innerHTML = '<b>0</b> URLs';
-    State.isLoading = false;
-    DOM.bulkLoadBtn.disabled = false;
+    finishBulkLoadUI();
   });
 
   on(DOM.bulkClearBtn, 'click', function () {
@@ -2126,7 +1987,6 @@
   });
 
   on(DOM.clearAllBtn, 'click', function () {
-    ProgressiveLoad.clear();
     Virtual.clear();
   });
 
