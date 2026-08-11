@@ -57,6 +57,7 @@
   --green:   #2ecc71;
   --blue:    #7c9dff;
   --blue2:   #5a7ee0;
+  --note:    #c9a3ff;
 
   --shadow-card:    rgba(245,197,24,0.10);
   --shadow-editing: rgba(245,197,24,0.30);
@@ -98,6 +99,7 @@
   --green:   #27ae60;
   --blue:    #3a5fc8;
   --blue2:   #2a4ab0;
+  --note:    #7c4fc0;
 
   --shadow-card:    rgba(0,0,0,0.08);
   --shadow-editing: rgba(180,160,0,0.35);
@@ -579,6 +581,24 @@ body.edit-active .card:not(.editing) {
   border-color: rgba(100,120,255,0.50);
 }
 
+/* ── Note button — violet; fills in solid once a note has text,
+   so a card with a note is recognizable even while its notes
+   panel is collapsed ── */
+.tnote {
+  flex: 1; height: 26px; border: none; border-radius: 4px;
+  font-size: 9px; font-weight: 700; font-family: inherit;
+  cursor: pointer; text-transform: uppercase; letter-spacing: 0.5px;
+  transition: all 0.13s;
+  background: rgba(180,140,255,0.08); color: var(--note);
+  border: 1px solid rgba(180,140,255,0.22);
+}
+.tnote:hover { background: rgba(180,140,255,0.16); }
+.tnote.has-note {
+  background: rgba(180,140,255,0.24);
+  color: var(--note);
+  border-color: rgba(180,140,255,0.55);
+}
+
 /* ── Remove button ── */
 .tremove {
   flex: 1; height: 26px; border: none; border-radius: 4px;
@@ -589,6 +609,57 @@ body.edit-active .card:not(.editing) {
   border: 1px solid rgba(231,76,60,0.18);
 }
 .tremove:hover { background: rgba(231,76,60,0.16); }
+
+/* ══════════════════════════════════════════════════════════
+   NOTES PANEL  — collapsible, per-card, memory-only.
+   Toggled open/closed by the toolbar's Note button. Text is
+   never persisted (see NoteState in app.js): closing the tab
+   or hitting reload clears it, which is the intended behavior.
+══════════════════════════════════════════════════════════ */
+.card-notes {
+  padding: 8px 8px 9px;
+  border-top: 1px solid var(--border-main);
+  background: var(--bg-toolbar);
+  border-radius: 0 0 8px 8px;
+  transition: background 0.35s ease, border-color 0.35s ease;
+}
+.card-notes.hide { display: none; }
+
+.card-notes-head {
+  display: flex; align-items: center; justify-content: space-between;
+  margin-bottom: 5px;
+}
+.card-notes-label {
+  font-size: 9px; font-weight: 700; text-transform: uppercase;
+  letter-spacing: 0.6px; color: var(--note);
+}
+.card-notes-clear {
+  background: transparent; border: none; cursor: pointer;
+  font-size: 9px; font-family: inherit; padding: 0;
+  color: var(--text-secondary); text-decoration: underline;
+  transition: color 0.14s;
+}
+.card-notes-clear:hover { color: var(--red); }
+.card-notes-clear.hide { visibility: hidden; }
+
+.card-notes-input {
+  width: 100%; min-height: 52px; max-height: 220px;
+  padding: 7px 9px;
+  background: var(--bg-field);
+  border: 1px solid var(--border-field);
+  border-radius: 5px; color: var(--text-primary);
+  font-size: 11px; font-family: inherit; line-height: 1.5;
+  resize: vertical; outline: none; display: block;
+  transition: border-color 0.15s, background 0.35s ease, color 0.35s ease;
+}
+.card-notes-input:focus { border-color: var(--note); }
+.card-notes-input::placeholder { color: var(--text-secondary); opacity: 0.6; }
+
+.card-notes-count {
+  display: block; text-align: right; margin-top: 3px;
+  font-size: 8px; color: var(--text-dims);
+  font-variant-numeric: tabular-nums;
+}
 
 /* Zoom hint overlay */
 .zoom-hint {
@@ -800,6 +871,134 @@ body.edit-active .card:not(.editing) {
   opacity: 0.55; line-height: 1.6;
   text-align: center;
   transition: color 0.35s;
+}
+
+/* ══════════════════════════════════════════════════════════
+   COMMON NOTES  (session-only scratchpad, opened from top bar)
+
+   ─ Fully independent of the per-card Notes panel above
+     (.card-notes / NoteState) — this is a single global
+     scratchpad, not tied to any media item.
+   ─ Static, singleton DOM node toggled via the .visible class
+     only — nothing is ever created/destroyed, so repeated
+     open/close cannot spawn duplicate modals.
+   ─ Nothing here touches storage/cookies/network: the textarea
+     value lives only in the DOM and is gone on reload.
+══════════════════════════════════════════════════════════ */
+.btn-notes:hover {
+  color: var(--note);
+  border-color: var(--note);
+  background: rgba(180,140,255,0.10);
+}
+
+.cn-overlay {
+  position: fixed; inset: 0;
+  background: var(--bg-overlay);
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
+  display: flex; align-items: center; justify-content: center;
+  padding: 24px;
+  z-index: 700;                  /* above help-tooltip (600) and #btt (600) */
+  opacity: 0; pointer-events: none;
+  transition: opacity 0.18s ease;
+}
+.cn-overlay.visible { opacity: 1; pointer-events: auto; }
+
+.cn-modal {
+  width: min(560px, 100%);
+  max-height: min(600px, 84vh);
+  display: flex; flex-direction: column;
+  background: var(--bg-panel);
+  border: 1px solid var(--border-main);
+  border-radius: 10px;
+  box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+  transform: scale(0.97) translateY(4px);
+  transition: transform 0.18s cubic-bezier(0.4,0,0.2,1),
+              background 0.35s ease, border-color 0.35s ease;
+}
+.cn-overlay.visible .cn-modal { transform: scale(1) translateY(0); }
+
+.cn-header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 13px 16px;
+  border-bottom: 1px solid var(--border-main);
+  flex-shrink: 0;
+  transition: border-color 0.35s ease;
+}
+.cn-title {
+  display: flex; align-items: center; gap: 7px;
+  font-size: 10px; font-weight: 800;
+  text-transform: uppercase; letter-spacing: 1.8px;
+  color: var(--note);
+}
+.cn-icon { font-size: 15px; }
+.cn-close {
+  width: 26px; height: 26px;
+  background: transparent;
+  border: 1px solid var(--border-btn);
+  border-radius: 4px;
+  color: var(--text-secondary);
+  font-size: 11px; font-family: inherit;
+  cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+  transition: color 0.13s, border-color 0.13s;
+}
+.cn-close:hover { color: var(--text-primary); border-color: var(--text-secondary); }
+
+.cn-body {
+  flex: 1;
+  min-height: 0;                 /* let the textarea shrink instead of overflowing the modal */
+  padding: 16px;
+  display: flex;
+}
+.cn-textarea {
+  flex: 1;
+  width: 100%;
+  min-height: 220px;
+  resize: vertical;
+  background: var(--bg-field);
+  border: 1px solid var(--border-field);
+  border-radius: 6px;
+  padding: 12px;
+  color: var(--text-primary);
+  font-family: inherit;
+  font-size: 13px;
+  line-height: 1.6;
+  outline: none;
+  transition: border-color 0.15s, background 0.35s ease, color 0.35s ease;
+}
+.cn-textarea:focus { border-color: var(--note); }
+.cn-textarea::placeholder { color: var(--text-secondary); opacity: 0.6; }
+
+.cn-footer {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 12px;
+  padding: 10px 16px 14px;
+  flex-shrink: 0;
+}
+.cn-hint {
+  font-size: 9px; color: var(--text-secondary);
+  opacity: 0.65; line-height: 1.5;
+}
+.cn-clear {
+  flex-shrink: 0;
+  background: transparent;
+  border: 1px solid var(--border-btn);
+  border-radius: 5px;
+  color: var(--text-secondary);
+  font-size: 10px; font-weight: 700;
+  letter-spacing: 0.4px;
+  font-family: inherit;
+  padding: 6px 10px;
+  cursor: pointer;
+  transition: color 0.13s, border-color 0.13s;
+}
+.cn-clear:hover { color: var(--red); border-color: var(--red); }
+
+@media (max-width: 600px) {
+  .cn-overlay { padding: 12px; }
+  .cn-modal { max-height: 90vh; }
+  .cn-textarea { min-height: 160px; }
 }
 
 /* ══════════════════════════════════════════════════════════

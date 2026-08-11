@@ -125,6 +125,11 @@
     themeLabel   : $('themeLabel'),
     helpBtn      : $('helpBtn'),
     helpTooltip  : $('helpTooltip'),
+    commonNotesBtn : $('commonNotesBtn'),
+    cnOverlay    : $('commonNotesOverlay'),
+    cnClose      : $('cnClose'),
+    cnTextarea   : $('cnTextarea'),
+    cnClearBtn   : $('cnClearBtn'),
     pauseAllBtn  : $('pauseAllBtn'),
     muteAllBtn   : $('muteAllBtn'),
     globalSpeed  : $('globalSpeed'),
@@ -149,6 +154,7 @@
     isLoading  : false,
     editStates : Object.create(null),
     videoStates: Object.create(null),
+    noteStates : Object.create(null),
     mediaStates: Object.create(null),
     retryWaiters: Object.create(null),
     videoOverrides: new Set(), /* URLs confirmed as video via probe fallback */
@@ -291,6 +297,58 @@
     on(document, 'click', function () {
       if (open) { open = false; DOM.helpTooltip.classList.remove('visible'); }
     });
+  })();
+
+  /* ════════════════════════════════════════════════════════
+     COMMON NOTES  (global, session-only scratchpad — top bar)
+     ─ Fully separate from the per-card Notes feature above
+       (NoteState / .card-notes): this is one shared textarea,
+       not tied to any media URL.
+     ─ Static singleton modal, toggled via a CSS class only —
+       no DOM is created or destroyed on open/close, so repeated
+       clicks can't spawn duplicate instances.
+     ─ Value lives only in the textarea's in-memory DOM node:
+       never written to localStorage/sessionStorage/cookies/a
+       backend, so a reload clears it automatically.
+  ════════════════════════════════════════════════════════ */
+  var CommonNotes = (function () {
+    var open = false;
+    var lastFocus = null;
+
+    function isOpen() { return open; }
+
+    function show() {
+      if (open) return;               /* guard: never open a second time */
+      open = true;
+      lastFocus = document.activeElement;
+      DOM.cnOverlay.classList.add('visible');
+      DOM.cnOverlay.setAttribute('aria-hidden', 'false');
+      /* Defer focus one frame so the fade/scale-in transition isn't
+         interrupted by the browser's focus-triggered scroll-into-view. */
+      requestAnimationFrame(function () { DOM.cnTextarea.focus(); });
+    }
+
+    function hide() {
+      if (!open) return;
+      open = false;
+      DOM.cnOverlay.classList.remove('visible');
+      DOM.cnOverlay.setAttribute('aria-hidden', 'true');
+      if (lastFocus && typeof lastFocus.focus === 'function') lastFocus.focus();
+      lastFocus = null;
+    }
+
+    on(DOM.commonNotesBtn, 'click', function (e) { e.stopPropagation(); show(); });
+    on(DOM.cnClose, 'click', hide);
+    /* Click on the dimmed backdrop (not the modal card itself) closes it. */
+    on(DOM.cnOverlay, 'click', function (e) {
+      if (e.target === DOM.cnOverlay) hide();
+    });
+    on(DOM.cnClearBtn, 'click', function () {
+      DOM.cnTextarea.value = '';
+      DOM.cnTextarea.focus();
+    });
+
+    return { isOpen: isOpen, show: show, hide: hide };
   })();
 
   /* ════════════════════════════════════════════════════════
@@ -613,6 +671,39 @@
   };
 
   /* ════════════════════════════════════════════════════════
+     NOTE STATE  (per-card free-text notes — memory only)
+
+     Keyed by URL, same pattern as EditState/VideoState, so a note
+     survives virtualization (card scrolled off-screen, DOM torn down,
+     then rebuilt when it scrolls back — see Virtual.activate/deactivate)
+     and survives an image<->video type swap for the same URL. It is
+     NEVER written to localStorage/sessionStorage/disk, so a real
+     browser reload wipes it — that reset-on-reload behavior is free,
+     not something we implement, because nothing here is persisted.
+
+     A blank/whitespace-only note is treated as "no note" and the key
+     is dropped, so State.noteStates only ever holds real content and
+     the has-note indicator can't get stuck on for an empty box.
+  ════════════════════════════════════════════════════════ */
+  var NOTE_MAX_LEN = 4000;
+  var NoteState = {
+    get: function (url) {
+      var s = State.noteStates[url];
+      return typeof s === 'string' ? s : '';
+    },
+    set: function (url, text) {
+      if (typeof text !== 'string') text = '';
+      if (text.length > NOTE_MAX_LEN) text = text.slice(0, NOTE_MAX_LEN);
+      if (text.trim() === '') delete State.noteStates[url];
+      else State.noteStates[url] = text;
+    },
+    has: function (url) {
+      var s = State.noteStates[url];
+      return !!(s && s.trim() !== '');
+    }
+  };
+
+  /* ════════════════════════════════════════════════════════
      EDIT MODE  (singleton — lazy panel wire-up)
   ════════════════════════════════════════════════════════ */
   var EditMode = (function () {
@@ -768,13 +859,79 @@
       var editBtn = makeBtn('tedit', 'Edit');
       on(editBtn, 'click', function () { opts.onEdit && opts.onEdit(editBtn); });
 
+      var noteBtn = makeBtn('tnote', 'Note', 'Add a note for this item (kept while you scroll, cleared on page reload)');
+      on(noteBtn, 'click', function (ev) {
+        ev && ev.stopPropagation && ev.stopPropagation();
+        opts.onNote && opts.onNote(noteBtn);
+      });
+
       var removeBtn = makeBtn('tremove', 'Remove');
       on(removeBtn, 'click', function () { opts.onRemove && opts.onRemove(); });
 
       bar.appendChild(copyBtn);
       bar.appendChild(editBtn);
+      bar.appendChild(noteBtn);
       bar.appendChild(removeBtn);
       return bar;
+    }
+
+    /* Collapsible per-card Notes panel — textarea + char counter + Clear.
+       opts: url (State.noteStates key), noteBtn (toolbar button kept in
+       sync so a card shows it has a note even while the panel is closed).
+       Text is written to State.noteStates on every keystroke (not just
+       blur) because the gallery is virtualized: a card can be torn down
+       the instant it scrolls out of view, mid-keystroke, with no warning. */
+    function notesSection(url, noteBtn) {
+      var wrap = el('div', 'card-notes hide');
+
+      var head = el('div', 'card-notes-head');
+      head.appendChild(el('span', 'card-notes-label', 'Note'));
+      var clearBtn = makeBtn('card-notes-clear hide', 'Clear', 'Clear this note');
+      clearBtn.type = 'button';
+      head.appendChild(clearBtn);
+
+      var ta = el('textarea', 'card-notes-input');
+      ta.placeholder = 'Add a note\u2026 (cleared on page reload)';
+      ta.maxLength = NOTE_MAX_LEN;
+      ta.spellcheck = true;
+      ta.value = NoteState.get(url);
+
+      var count = el('span', 'card-notes-count');
+
+      function sync() {
+        var has = NoteState.has(url);
+        if (noteBtn) noteBtn.classList.toggle('has-note', has);
+        clearBtn.classList.toggle('hide', !ta.value);
+        count.textContent = ta.value.length + ' / ' + NOTE_MAX_LEN;
+      }
+
+      on(ta, 'input', function () {
+        NoteState.set(url, ta.value);
+        sync();
+      });
+      /* Defensive: stop clicks/drags/wheel inside the textarea from
+         reaching card-level handlers (zoom/pan, etc.) — mirrors the
+         stopPropagation already used on the toolbar's Copy button. */
+      on(ta, 'mousedown', Util.stop);
+      on(ta, 'click', Util.stop);
+      on(ta, 'wheel', Util.stop);
+
+      on(clearBtn, 'click', function (ev) {
+        Util.stop(ev);
+        ta.value = '';
+        NoteState.set(url, '');
+        sync();
+        ta.focus();
+      });
+
+      wrap.appendChild(head);
+      wrap.appendChild(ta);
+      wrap.appendChild(count);
+
+      sync();
+      if (NoteState.has(url)) wrap.classList.remove('hide');
+
+      return { wrap: wrap, textarea: ta };
     }
 
     /* Single removeCard helper used by both card types. */
@@ -789,6 +946,7 @@
       State.allUrls.splice(idx, 1);
       delete State.editStates[url];
       delete State.videoStates[url];
+      delete State.noteStates[url];
       MediaState.remove(url);
       delete State.retryWaiters[url];
 
@@ -826,7 +984,8 @@
 
     return {
       header: header, urlRow: urlRow, toolbar: toolbar, removeCard: removeCard,
-      makeBtn: makeBtn, buildErrorView: buildErrorView, zoomOverlay: zoomOverlay
+      makeBtn: makeBtn, buildErrorView: buildErrorView, zoomOverlay: zoomOverlay,
+      notesSection: notesSection
     };
   })();
 
@@ -1206,6 +1365,7 @@
       card.appendChild(h.hdr);
       card.appendChild(box);
       card.appendChild(Chrome.urlRow(url));
+      var notes; /* assigned just below; onNote only fires later, on click */
       card.appendChild(Chrome.toolbar({
         url: url,
         onEdit: function () {
@@ -1216,8 +1376,12 @@
             EditMode.enter(card, url);
           }
         },
+        onNote: function () { notes.wrap.classList.toggle('hide'); },
         onRemove: function () { Chrome.removeCard(card, ci, box._destroy); }
       }));
+      var noteBtn = card.querySelector('.tnote');
+      notes = Chrome.notesSection(url, noteBtn);
+      card.appendChild(notes.wrap);
       return card;
     }
 
@@ -1431,6 +1595,7 @@
       card.appendChild(h.hdr);
       card.appendChild(box);
       card.appendChild(Chrome.urlRow(url));
+      var notes; /* assigned just below; onNote only fires later, on click */
       card.appendChild(Chrome.toolbar({
         url: url,
         onCopyLink: function () {
@@ -1443,8 +1608,12 @@
           if (card.classList.contains('editing')) { EditMode.exit(false); }
           else { video.pause(); zoom.reset(false); EditMode.enter(card, url); }
         },
+        onNote: function () { notes.wrap.classList.toggle('hide'); },
         onRemove: function () { Chrome.removeCard(card, ci, box._destroy); }
       }));
+      var noteBtn = card.querySelector('.tnote');
+      notes = Chrome.notesSection(url, noteBtn);
+      card.appendChild(notes.wrap);
 
       /* Expose for keyboard handler */
       card._video     = video;
@@ -1848,10 +2017,15 @@
     }
 
     on(document, 'keydown', function (e) {
-      /* Space: play/pause hovered video, otherwise block native scroll */
+      /* Space: play/pause hovered video, otherwise block native scroll.
+         Bail out first when a text field (URL box, card notes, …) is
+         focused so Space types a literal space instead of being eaten —
+         previously this fired e.preventDefault() unconditionally, which
+         made it impossible to type multi-word notes. */
       if (e.code === 'Space') {
+        if (Util.isTyping()) return;
         e.preventDefault();
-        if (!Util.isTyping() && State.hoveredVideoCard && State.hoveredVideoCard._video) {
+        if (State.hoveredVideoCard && State.hoveredVideoCard._video) {
           var v = State.hoveredVideoCard._video;
           if (v.paused) v.play().catch(function () {}); else v.pause();
           return;
@@ -1863,6 +2037,7 @@
       if (!Util.isTyping() && handleVideoShortcut(e)) return;
 
       if (e.key === 'Escape') {
+        if (CommonNotes.isOpen()) { CommonNotes.hide(); return; }
         if (EditMode.isActive()) EditMode.exit(false);
         return;
       }

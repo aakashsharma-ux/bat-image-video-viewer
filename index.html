@@ -51,6 +51,8 @@
     <span class="ctrl-label" id="themeLabel">🌙 Night</span>
   </label>
 
+  <button class="btn-bar btn-notes" id="commonNotesBtn" title="Common Notes — a session-only scratchpad, separate from per-card notes">🗒 Common Notes</button>
+
   <button class="btn-help" id="helpBtn" title="Keyboard Shortcuts">⌨</button>
   <div class="help-tooltip" id="helpTooltip">
     <div class="help-row"><kbd>W</kbd><kbd>S</kbd> or <kbd>↑</kbd><kbd>↓</kbd><kbd>←</kbd><kbd>→</kbd> <span>Scroll</span></div>
@@ -120,6 +122,26 @@
     </div>
 
     <div class="ep-hint">Changes apply to this session only.<br>Exit edit mode to resume normal viewing.</div>
+  </div>
+</div>
+
+<!-- COMMON NOTES — session-only scratchpad, hidden by default until opened -->
+<div id="commonNotesOverlay" class="cn-overlay" aria-hidden="true">
+  <div class="cn-modal" role="dialog" aria-modal="true" aria-labelledby="cnTitle">
+    <div class="cn-header">
+      <div class="cn-title" id="cnTitle">
+        <span class="cn-icon">🗒</span>
+        <span>Common Notes</span>
+      </div>
+      <button class="cn-close" id="cnClose" title="Close (Esc)">✕</button>
+    </div>
+    <div class="cn-body">
+      <textarea id="cnTextarea" class="cn-textarea" placeholder="Jot down anything here… kept only for this session and cleared automatically on reload." spellcheck="true"></textarea>
+    </div>
+    <div class="cn-footer">
+      <span class="cn-hint">Session only — never saved to storage, cookies, or a server.</span>
+      <button class="cn-clear" id="cnClearBtn" title="Delete all notes">Clear All</button>
+    </div>
   </div>
 </div>
 
