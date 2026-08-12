@@ -125,6 +125,7 @@
     themeLabel   : $('themeLabel'),
     helpBtn      : $('helpBtn'),
     helpTooltip  : $('helpTooltip'),
+    topbar       : $('topbar'),
     commonNotesBtn : $('commonNotesBtn'),
     cnOverlay    : $('commonNotesOverlay'),
     cnClose      : $('cnClose'),
@@ -2232,6 +2233,26 @@
     DOM.btt.classList.toggle('show', window.scrollY > 280);
   }, { passive: true });
   on(DOM.btt, 'click', function () { window.scrollTo({ top: 0, behavior: 'smooth' }); });
+
+  /* ════════════════════════════════════════════════════════
+     TOPBAR HEIGHT SYNC
+     ─ The topbar wraps to a second row instead of scrolling
+       horizontally on narrow screens. Keep --topbar-h synced
+       to its real rendered height so the fixed-position Edit
+       Mode panel always sits flush below it, at any width.
+  ════════════════════════════════════════════════════════ */
+  (function () {
+    function sync() {
+      var h = DOM.topbar ? DOM.topbar.offsetHeight : 54;
+      document.documentElement.style.setProperty('--topbar-h', h + 'px');
+    }
+    sync();
+    if (typeof ResizeObserver === 'function' && DOM.topbar) {
+      new ResizeObserver(sync).observe(DOM.topbar);
+    } else {
+      on(window, 'resize', sync);
+    }
+  })();
 
   refreshCount();
 })();
