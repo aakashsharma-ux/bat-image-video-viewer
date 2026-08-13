@@ -415,11 +415,6 @@ kbd {
   transition: box-shadow 0.18s, border-color 0.18s, background 0.35s ease, opacity 0.2s ease;
 }
 
-/* Edit-mode dim: non-editing cards fade back subtly */
-body.edit-active .card:not(.editing) {
-  opacity: 0.72;
-}
-
 /* The card being edited — gold highlight, full opacity */
 .card.editing {
   border-color: var(--gold) !important;
