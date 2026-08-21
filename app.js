@@ -1,5 +1,23 @@
 /* ════════════════════════════════════════════════════════════
-   BAT-VIEWER  app.js  v17
+   BAT-VIEWER  app.js  v18
+
+   HIGHLIGHTS (v18) — Intelligent Fast Media Format Fallback:
+   ─ The image<->video swap-on-error fallback (trySwapMediaType) now
+     fires on ANY first-load failure, not just genuinely ambiguous
+     URLs (no extension/MIME hint). A confidently-typed URL (real
+     .jpg/.mp4 extension, S3 MIME hint) that fails now also gets one
+     fast, immediate shot at the other format before being marked
+     failed, instead of going straight to the failed/retry state.
+   ─ That widened fallback is loop-safe (State.fallbackAttempted caps
+     it at one swap per URL, independent of type memory) and doesn't
+     corrupt future type detection: a confidently-typed URL's swap is
+     only remembered if it actually succeeds. If both formats fail,
+     no override is left behind, so a later re-render or retry tries
+     the correct original format again instead of getting stuck.
+   ─ Failure reasons (native video MediaError detail, or which format
+     failed first when both were tried) are now stored on
+     MediaState[url].failReason and logged via console.warn for
+     debugging — nothing new in the UI itself.
 
    REFACTOR HIGHLIGHTS (v17):
    ─ Single shared "chrome" layer: header, url-row, toolbar,
@@ -160,6 +178,11 @@
     retryWaiters: Object.create(null),
     videoOverrides: new Set(), /* URLs confirmed as video via probe fallback */
     imageOverrides: new Set(), /* URLs confirmed as image via fallback */
+    fallbackAttempted: new Set(), /* URLs that already had ONE cross-format
+      fallback attempt (image<->video) triggered — independent of the
+      override sets above, so a confidently-typed URL can get a one-shot
+      fallback try without that attempt permanently overwriting its type
+      if the fallback also fails. See trySwapMediaType(). */
     spaceHeld  : false,
     hoveredBox : null,
     hoveredVideoCard: null,
@@ -186,16 +209,27 @@
         s = State.mediaStates[url] = {
           status: null,
           type: null,
-          retryCount: 0
+          retryCount: 0,
+          failReason: null
         };
       }
       return s;
     },
-    set: function (url, status, type) {
+    /* `reason` is optional and only meaningful alongside FAILED — kept on
+       the state object (not shown in the UI) so it's inspectable from the
+       console for debugging (window doesn't expose State, but this is
+       reachable via a breakpoint/log) when a media item won't load. */
+    set: function (url, status, type, reason) {
       var s = MediaState.get(url);
       s.status = status;
       if (type) s.type = type;
-      if (status === MEDIA_STATUS.LOADED) s.retryCount = 0;
+      if (status === MEDIA_STATUS.LOADED) { s.retryCount = 0; s.failReason = null; }
+      if (status === MEDIA_STATUS.FAILED && reason) {
+        s.failReason = reason;
+        if (typeof console !== 'undefined' && console.warn) {
+          console.warn('[BAT Viewer] media failed to load:', url, '\u2014', reason);
+        }
+      }
       return s;
     },
     beginRetry: function (url, type, applyLimit) {
@@ -422,12 +456,16 @@
           its best current guess immediately and is corrected in place
           if the probe later disagrees.
        4. If everything above is inconclusive we still render with a
-          default guess, but that guess is NOT confident. Only
-          unconfident guesses are allowed a one-time swap-on-error in
-          ImageCard/VideoCard. A confidently-typed URL (steps 1-3) that
-          fails to load is treated as a genuine network/S3 failure and
-          goes through the normal retry path instead of being
-          reclassified as the other media type.
+          default guess, but that guess is NOT confident.
+
+       Regardless of confidence, ANY media that fails its first load
+       attempt gets one fast, automatic shot at the OTHER format before
+       it's shown as failed (see trySwapMediaType below) — a wrong
+       extension, a mislabeled S3 object, or genuinely corrupt media are
+       all indistinguishable from "this format doesn't work" until we've
+       actually tried decoding it. The one exception to memory: if a
+       confidently-typed URL's fallback attempt ALSO fails, that guess is
+       not kept — see trySwapMediaType's comment for why.
   ════════════════════════════════════════════════════════ */
   /* Boundary is "end of string OR any non-alphanumeric character" rather
      than just "?/#/end" — this still refuses to match inside a longer
@@ -535,21 +573,56 @@
   }
 
   /* Shared by ImageCard/VideoCard onerror handlers: when a media
-     element fails and its type was only ever a low-confidence guess
-     (no real extension/MIME hint) AND the other type hasn't already
-     been tried for this URL, swap the card to the other media type
-     once instead of giving up immediately. A confidently-typed URL
-     that fails is a genuine network/S3 failure and this is skipped,
-     going straight to the normal failed/retry flow instead. Returns
-     true if a swap was performed (caller should stop there). */
+     element fails and the OTHER type hasn't already been tried for this
+     URL, swap the card to that other media type once instead of giving
+     up immediately — "Intelligent Fast Media Format Fallback". Fires on
+     ANY failure, confidently-typed URL or not: a real .jpg/.mp4
+     extension is usually right, but a wrong extension, a mislabeled S3
+     object, or corrupt bytes look identical to a network failure until
+     the browser has actually tried to decode them, and this fallback
+     is cheap and immediate (reuses the same URL, no re-download of
+     anything already fetched, no added delay).
+
+     `State.fallbackAttempted` (separate from the videoOverrides /
+     imageOverrides type-memory sets) is the one-shot loop guard here —
+     it caps this at a single swap per URL regardless of outcome:
+       detected format -> alternate format -> failed
+     and is checked/set independently of whether the type guess itself
+     gets remembered.
+
+     Memory of the swapped-to type (`overrideSet`) is handled
+     differently depending on how confident the ORIGINAL guess was:
+       - Genuinely ambiguous URL (no extension/MIME hint): remember the
+         swap immediately, same as before this fallback was widened —
+         there's no more-authoritative type to fall back on if this
+         guess turns out wrong too, so keeping the best available guess
+         is still correct.
+       - Confidently-typed URL (real extension/MIME hint): do NOT
+         remember the swap yet. It's only confirmed (added to
+         overrideSet) if the fallback actually succeeds — see the
+         `swapCtx.confirmOverride` handling in ImageCard/VideoCard's
+         load success handlers below. If the fallback ALSO fails, no
+         override is left behind, so getMediaType() keeps returning the
+         original confident detection — a later re-render (scrolling the
+         slot out and back, or VideoCard's smart retry) tries the
+         correct format again instead of getting stuck retrying the
+         wrong one forever.
+
+     Returns true if a swap was performed (caller should stop there and
+     not show a failed state yet). */
   function trySwapMediaType(url, card, box, zoom, overrideSet, buildOther) {
-    var alreadyTried = State.videoOverrides.has(url) || State.imageOverrides.has(url);
-    if (alreadyTried || isConfidentMediaType(url)) return false;
+    if (State.fallbackAttempted.has(url)) return false;
     var parentSlot = card.closest('.vslot');
     if (!parentSlot) return false;
-    overrideSet.add(url);
+    State.fallbackAttempted.add(url);
+    var firstType = card.classList.contains('card-video-card') ? 'video' : 'image';
+    var confident = isConfidentMediaType(url);
+    var swapCtx = { firstType: firstType, confirmOverride: confident ? overrideSet : null };
+    if (!confident) overrideSet.add(url);
     if (box._destroy) box._destroy(); else zoom.destroy();
-    Virtual.rebuildSlot(parentSlot, parseInt(parentSlot.dataset.idx, 10), buildOther);
+    Virtual.rebuildSlot(parentSlot, parseInt(parentSlot.dataset.idx, 10), function (i) {
+      return buildOther(i, swapCtx);
+    });
     return true;
   }
 
@@ -1069,6 +1142,7 @@
       State.allUrls = []; State.slots = []; State.activeSet = new Set();
       State.videoOverrides.clear();
       State.imageOverrides.clear();
+      State.fallbackAttempted.clear();
       VideoState.clear();
       MediaState.clear();
       State.retryWaiters = Object.create(null);
@@ -1226,7 +1300,13 @@
      IMAGE CARD
   ════════════════════════════════════════════════════════ */
   var ImageCard = (function () {
-    function build(ci) {
+    /* `swapCtx` is only present when this card is being built as the
+       automatic cross-format fallback for a video that just failed —
+       see trySwapMediaType. { firstType, confirmOverride } — confirmOverride
+       is the Set to add `url` to if THIS load succeeds (only set when the
+       original video detection was confident; see trySwapMediaType's
+       comment for why an unconfirmed guess isn't remembered on failure). */
+    function build(ci, swapCtx) {
       var url = State.allUrls[ci];
       var card = el('div', 'card');
       var h = Chrome.header(ci + 1, 'image');
@@ -1259,8 +1339,8 @@
       var pendingRetry = null;
       var retryInFlight = false;
 
-      function syncCardStatus(status) {
-        MediaState.set(url, status, 'image');
+      function syncCardStatus(status, reason) {
+        MediaState.set(url, status, 'image', reason);
         card.dataset.mediaStatus = status;
       }
 
@@ -1293,12 +1373,12 @@
         if (hint.parentNode       !== box) box.appendChild(hint);
       }
 
-      function showFailedView(resolvePending) {
+      function showFailedView(resolvePending, reason) {
         if (activeSpin) { activeSpin.remove(); activeSpin = null; }
         if (rotateWrap.parentNode === box) box.removeChild(rotateWrap);
         if (badge.parentNode      === box) box.removeChild(badge);
         if (hint.parentNode       === box) box.removeChild(hint);
-        syncCardStatus(MEDIA_STATUS.FAILED);
+        syncCardStatus(MEDIA_STATUS.FAILED, reason);
         if (resolvePending) resolveRetry(false);
         if (errDiv && errDiv.parentNode) return;
         errDiv = Chrome.buildErrorView(box, 'Could not load', url, function () {
@@ -1325,16 +1405,22 @@
       on(img, 'load', function () {
         if (activeSpin) { activeSpin.remove(); activeSpin = null; }
         syncCardStatus(MEDIA_STATUS.LOADED);
+        /* This card is the fallback attempt after a video failed, and it
+           actually decoded as an image — now it's safe to remember. */
+        if (swapCtx && swapCtx.confirmOverride) swapCtx.confirmOverride.add(url);
         resolveRetry(true);
         if (img.naturalWidth) h.dimsEl.textContent = img.naturalWidth + ' \u00d7 ' + img.naturalHeight;
         zoom.syncCursor();
       });
       on(img, 'error', function () {
         if (suppressErrors) return;
-        /* See trySwapMediaType: a low-confidence type guess gets one
-           shot at the other media type before we call it a real failure. */
+        /* Fast automatic fallback: try the other media type once before
+           giving up — see trySwapMediaType for the full rationale. */
         if (trySwapMediaType(url, card, box, zoom, State.videoOverrides, VideoCard.build)) return;
-        showFailedView(true);
+        var reason = swapCtx
+          ? ('image fallback also failed (' + swapCtx.firstType + ' failed first)')
+          : 'image failed to load';
+        showFailedView(true, reason);
       });
       rotateWrap.appendChild(img);
       box.appendChild(rotateWrap);
@@ -1408,7 +1494,17 @@
     var PLAYBACK_RATES = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 4];
     var FRAME_STEP = 1 / 30;
 
-    function build(ci) {
+    /* See ImageCard.build's matching doc comment — same swapCtx contract,
+       mirrored for the image-failed-so-try-video direction. */
+    var VIDEO_ERROR_CODES = { 1: 'ABORTED', 2: 'NETWORK', 3: 'DECODE', 4: 'SRC_NOT_SUPPORTED' };
+    function videoErrorReason(video) {
+      var e = video.error;
+      if (!e) return 'video error: unknown';
+      var name = VIDEO_ERROR_CODES[e.code] || ('code ' + e.code);
+      return 'video error: ' + name + (e.message ? ' - ' + e.message : '');
+    }
+
+    function build(ci, swapCtx) {
       var url = State.allUrls[ci];
       var stored = VideoState.get(url);
       var startsFailed = MediaState.get(url).status === MEDIA_STATUS.FAILED;
@@ -1472,8 +1568,8 @@
       var suppressErrors = false;
       var retryInFlight = false;
 
-      function syncCardStatus(status) {
-        MediaState.set(url, status, 'video');
+      function syncCardStatus(status, reason) {
+        MediaState.set(url, status, 'video', reason);
         card.dataset.mediaStatus = status;
       }
 
@@ -1513,10 +1609,10 @@
         return wait;
       }
 
-      function showFailedView(resolvePending) {
+      function showFailedView(resolvePending, reason) {
         errored = true; video._errored = true;
         if (spin.parentNode) spin.remove();
-        syncCardStatus(MEDIA_STATUS.FAILED);
+        syncCardStatus(MEDIA_STATUS.FAILED, reason);
         if (resolvePending) resolveMediaRetry(url, false);
         retryInFlight = false;
         Util.unloadVideo(video);
@@ -1530,6 +1626,9 @@
       on(video, 'loadedmetadata', function () {
         if (spin.parentNode) spin.remove();
         syncCardStatus(MEDIA_STATUS.LOADED);
+        /* This card is the fallback attempt after an image failed, and it
+           actually decoded as a video — now it's safe to remember. */
+        if (swapCtx && swapCtx.confirmOverride) swapCtx.confirmOverride.add(url);
         resolveMediaRetry(url, true);
         if (video.videoWidth) {
           h.dimsEl.textContent = video.videoWidth + ' \u00d7 ' + video.videoHeight +
@@ -1544,9 +1643,13 @@
       on(video, 'error', function () {
         if (suppressErrors) return;
         if (errored) return;
-        /* Same confidence gate as ImageCard's onerror — see trySwapMediaType. */
+        /* Fast automatic fallback: try the other media type once before
+           giving up — see trySwapMediaType for the full rationale. */
         if (trySwapMediaType(url, card, box, zoom, State.imageOverrides, ImageCard.build)) return;
-        showFailedView(true);
+        var reason = swapCtx
+          ? (videoErrorReason(video) + '; ' + swapCtx.firstType + ' fallback also failed')
+          : videoErrorReason(video);
+        showFailedView(true, reason);
       });
 
       function persist() {
