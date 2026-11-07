@@ -1,5 +1,27 @@
 /* ════════════════════════════════════════════════════════════
-   BAT-VIEWER  app.js  v18
+   BAT-VIEWER  app.js  v19
+
+   HIGHLIGHTS (v19) — performance, accessibility, privacy:
+   ─ Code splitting: this file is the core. The video player, Edit
+     panel, Common Notes dialog and "retry all failed" run live in
+     chunks/*.js and are fetched only when first needed (see Chunks).
+   ─ Pagination: a load builds the first PAGE (100) slots; more are
+     added as the page-end sentinel nears the viewport, or with the
+     "Load more / Load all" buttons. State.allUrls still holds every
+     link, so the count, Append and Clear behave exactly as before.
+   ─ Cheaper work: sizing is one CSS-variable write instead of a
+     style write on every card; media-type detection and content-type
+     probes are cached; probes run through a small bounded queue;
+     input handlers are debounced / frame-throttled.
+   ─ Privacy: the theme is only written to localStorage after an
+     explicit choice (Consent). "Delete my data" wipes everything.
+   ─ Accessibility: real labels/alt text, focus management, keyboard
+     handling that no longer swallows Space on focused buttons.
+   ─ Rotation (Edit) fits the card: a rotated picture is sized as a
+     picture of its new shape and the card makes room for it, so it
+     is never clipped and never covers the card's buttons (RotateFit).
+   ─ v18 fallback logic, Edit/Video/Note state, zoom and the single
+     IntersectionObserver are unchanged.
 
    HIGHLIGHTS (v18) — Intelligent Fast Media Format Fallback:
    ─ The image<->video swap-on-error fallback (trySwapMediaType) now
@@ -61,9 +83,81 @@
       try { v.load(); } catch (_) {}
     }
     function stop(e) { e.stopPropagation(); }
+    /* A text box, slider or checkbox has focus, so letters/arrows/Space belong to
+       it. The two header switches are checkboxes too, but they take no text: after
+       a mouse click on one of them the page shortcuts must keep working (they
+       always did — those inputs used to be unfocusable). */
     function isTyping() {
       var a = document.activeElement;
-      return !!(a && (a.tagName === 'INPUT' || a.tagName === 'TEXTAREA' || a.isContentEditable));
+      if (!a) return false;
+      if (a.tagName === 'INPUT') return a.getAttribute('role') !== 'switch';
+      return a.tagName === 'TEXTAREA' || !!a.isContentEditable;
+    }
+
+    /* Keyboard or mouse? Space is the play/pause key for a hovered video, but it
+       must also press a button the keyboard user has Tabbed to. A button that is
+       merely still focused after a MOUSE click must not take Space away from the
+       video, so remember what the visitor is using: Tab switches to "keyboard",
+       any press of the mouse/finger switches back. (:focus-visible cannot tell:
+       Chrome sets it on the focused button at the moment any key goes down.)
+       Focus that arrives with its ring showing before any mouse use at all — a
+       Tab in from the address bar — counts as keyboard too. */
+    var keyboardMode = false, pointerSeen = false;
+    function usePointer() { keyboardMode = false; pointerSeen = true; }
+    on(document, 'pointerdown', usePointer, true);
+    on(document, 'mousedown',   usePointer, true);          /* browsers without pointer events */
+    on(document, 'keydown', function (e) { if (e.key === 'Tab') keyboardMode = true; }, true);
+    on(document, 'focusin', function (e) {
+      if (pointerSeen || keyboardMode) return;
+      try { if (e.target.matches(':focus-visible')) keyboardMode = true; } catch (_) {}
+    }, true);
+
+    /* True while the keyboard user's focus is on a control that Space should
+       activate (a button, a <select>, a role=button/switch) — the global Space
+       shortcut leaves those alone. */
+    function isInteractive() {
+      if (!keyboardMode) return false;
+      var a = document.activeElement;
+      if (!a || a === document.body) return false;
+      var role = a.getAttribute && a.getAttribute('role');
+      return /^(BUTTON|SELECT|SUMMARY)$/.test(a.tagName) || role === 'button' || role === 'switch';
+    }
+    /* Trailing debounce: runs `fn` once calls have stopped for `ms`.
+       .flush() runs a pending call right now; .cancel() drops it. */
+    function debounce(fn, ms) {
+      var tid = 0, lastArgs = null, lastThis = null;
+      function run() { tid = 0; var a = lastArgs, t = lastThis; lastArgs = lastThis = null; fn.apply(t, a); }
+      function debounced() { lastArgs = arguments; lastThis = this; clearTimeout(tid); tid = setTimeout(run, ms); }
+      debounced.flush  = function () { if (tid) { clearTimeout(tid); run(); } };
+      debounced.cancel = function () { clearTimeout(tid); tid = 0; lastArgs = lastThis = null; };
+      return debounced;
+    }
+    /* At most one call per animation frame; the latest arguments win. */
+    function rafThrottle(fn) {
+      var id = 0, lastArgs = null, lastThis = null;
+      function run() { id = 0; var a = lastArgs, t = lastThis; lastArgs = lastThis = null; fn.apply(t, a); }
+      function throttled() { lastArgs = arguments; lastThis = this; if (!id) id = requestAnimationFrame(run); }
+      throttled.cancel = function () { if (id) cancelAnimationFrame(id); id = 0; lastArgs = lastThis = null; };
+      return throttled;
+    }
+    function prefersReducedMotion() {
+      try { return !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches); }
+      catch (_) { return false; }
+    }
+    var uidCounter = 0;
+    function uid(prefix) { return prefix + (++uidCounter); }
+    /* Screen-reader description for a pasted link. We know nothing about the
+       picture itself, so use what the link does tell us: a real-looking file
+       name, otherwise the host it comes from. `kind` is 'Image' or 'Video'. */
+    function mediaLabel(url, kind) {
+      try {
+        var u = new URL(url);
+        if (u.protocol === 'data:' || u.protocol === 'blob:') return 'Embedded ' + kind.toLowerCase();
+        var seg = u.pathname.split('/').pop();
+        try { seg = decodeURIComponent(seg); } catch (_) {}
+        if (seg && seg.length <= 80 && /\.[a-z0-9]{2,5}$/i.test(seg) && !/^[0-9a-f-]{24,}\./i.test(seg)) return seg;
+        return kind + ' from ' + u.hostname;
+      } catch (_) { return kind; }
     }
     function clamp(v, lo, hi) { return v < lo ? lo : v > hi ? hi : v; }
     function pad(n, w) { n = String(n); while (n.length < w) n = '0' + n; return n; }
@@ -79,16 +173,19 @@
     }
     function fallbackCopy(text) {
       return new Promise(function (resolve, reject) {
+        var prev = document.activeElement;   /* put focus back afterwards (keyboard users) */
         try {
           var ta = document.createElement('textarea');
           ta.value = text;
           ta.setAttribute('readonly', '');
+          ta.setAttribute('aria-hidden', 'true');
           ta.style.cssText = 'position:fixed;top:0;left:0;opacity:0;pointer-events:none';
           document.body.appendChild(ta);
           ta.focus(); ta.select();
           ta.setSelectionRange(0, ta.value.length);
           var ok = document.execCommand('copy');
           ta.remove();
+          if (prev && prev.focus) { try { prev.focus({ preventScroll: true }); } catch (_) {} }
           ok ? resolve() : reject(new Error('execCommand copy failed'));
         } catch (e) { reject(e); }
       });
@@ -105,9 +202,10 @@
       return fallbackCopy(text);
     }
     return {
-      $: $, el: el, on: on, stop: stop, isTyping: isTyping,
+      $: $, el: el, on: on, stop: stop, isTyping: isTyping, isInteractive: isInteractive,
       clamp: clamp, fmtTime: fmtTime, copyToClipboard: copyToClipboard,
-      unloadVideo: unloadVideo
+      unloadVideo: unloadVideo, debounce: debounce, rafThrottle: rafThrottle,
+      prefersReducedMotion: prefersReducedMotion, uid: uid, mediaLabel: mediaLabel
     };
   })();
 
@@ -120,7 +218,15 @@
   ════════════════════════════════════════════════════════ */
   var DOM = {
     html         : document.documentElement,
+    script       : $('bvScript'),
+    pageBody     : $('pageBody'),
     gallery      : $('gallery'),
+    gallerySentinel : $('gallerySentinel'),
+    galleryMore  : $('galleryMore'),
+    galleryMoreText : $('galleryMoreText'),
+    loadMoreBtn  : $('loadMoreBtn'),
+    loadAllBtn   : $('loadAllBtn'),
+    gShown       : $('gShown'),
     bulkArea     : $('bulkArea'),
     bulkTally    : $('bulkTally'),
     bulkLoadBtn  : $('bulkLoadBtn'),
@@ -140,15 +246,18 @@
     zoomEnabled           : $('zoomEnabled'),
     retryVisibleFailedBtn : $('retryVisibleFailedBtn'),
     themeToggle           : $('themeToggle'),
-    themeLabel   : $('themeLabel'),
+    themeIcon    : $('themeIcon'),
+    themeName    : $('themeName'),
     helpBtn      : $('helpBtn'),
     helpTooltip  : $('helpTooltip'),
     topbar       : $('topbar'),
+    logoText     : document.querySelector('.logo-text'),
     commonNotesBtn : $('commonNotesBtn'),
-    cnOverlay    : $('commonNotesOverlay'),
-    cnClose      : $('cnClose'),
-    cnTextarea   : $('cnTextarea'),
-    cnClearBtn   : $('cnClearBtn'),
+    consentBanner  : $('consentBanner'),
+    consentAllow   : $('consentAllow'),
+    consentDeny    : $('consentDeny'),
+    privacySettingsBtn : $('privacySettingsBtn'),
+    deleteDataBtn      : $('deleteDataBtn'),
     pauseAllBtn  : $('pauseAllBtn'),
     muteAllBtn   : $('muteAllBtn'),
     globalSpeed  : $('globalSpeed'),
@@ -184,9 +293,7 @@
       fallback try without that attempt permanently overwriting its type
       if the fallback also fails. See trySwapMediaType(). */
     spaceHeld  : false,
-    hoveredBox : null,
-    hoveredVideoCard: null,
-    currentMaxH: '220px'
+    hoveredVideoCard: null
   };
 
   var MEDIA_STATUS = {
@@ -263,19 +370,27 @@
      STATUS / TOAST
   ════════════════════════════════════════════════════════ */
   var Toast = (function () {
-    var tid = null;
+    var tid = null, clearTid = null;
     function show(msg, cls, ms) {
-      clearTimeout(tid);
+      clearTimeout(tid); clearTimeout(clearTid);
       DOM.statusMsg.textContent = msg;
       DOM.statusMsg.className = 'status ' + (cls || 'ok');
-      tid = setTimeout(function () { DOM.statusMsg.className = 'status hide'; }, ms || 3000);
+      tid = setTimeout(function () {
+        DOM.statusMsg.className = 'status hide';
+        /* Once it has faded out, empty the live region so screen-reader
+           browse mode doesn't keep finding a stale message. */
+        clearTid = setTimeout(function () { DOM.statusMsg.textContent = ''; }, 400);
+      }, ms || 3000);
     }
     return { show: show };
   })();
 
+  /* onRetry is optional: without it this is just the loading skeleton
+     (used for the placeholder shown while a code chunk is still arriving). */
   function makeLoadingSpinner(onRetry) {
     var spin = el('div', 'card-spinner');
     spin.appendChild(el('div', 'spinner'));
+    if (typeof onRetry !== 'function') return spin;
     var retryBtn = el('button', 'card-loading-retry-btn');
     retryBtn.type = 'button';
     retryBtn.textContent = 'Retry';
@@ -283,7 +398,7 @@
     on(retryBtn, 'click', function (e) {
       e.preventDefault();
       e.stopPropagation();
-      if (typeof onRetry === 'function') onRetry();
+      onRetry();
     });
     spin.appendChild(retryBtn);
     return spin;
@@ -304,90 +419,352 @@
   }
 
   /* ════════════════════════════════════════════════════════
+     CHUNKS  (code that is fetched only when it is first needed)
+
+     chunks/*.js are plain scripts that register themselves:
+         BVChunk('video-card', function (bv) { ...; return api; });
+     `bv` hands them the few core pieces they use (see internals()).
+     Chunks.load(name) fetches the file once (same-origin, so the
+     `script-src 'self'` policy allows it), runs the factory once and
+     resolves with its API. A failed fetch can simply be tried again.
+
+     build.js writes the hashed file names into the script tag's
+     data-chunks attribute; in a plain checkout (no build) the files
+     are looked up as chunks/<name>.js.
+  ════════════════════════════════════════════════════════ */
+  var Chunks = (function () {
+    var factories = Object.create(null);   /* name -> factory(bv), filled in by BVChunk() */
+    var instances = Object.create(null);   /* name -> the chunk's public API */
+    var inflight  = Object.create(null);   /* name -> Promise of that API */
+    var manifest  = {};
+    try { manifest = JSON.parse((DOM.script && DOM.script.getAttribute('data-chunks')) || '{}'); } catch (_) {}
+    var bv = null;
+
+    window.BVChunk = function (name, factory) { factories[name] = factory; };
+
+    function internals() {
+      return bv || (bv = {
+        State: State, DOM: DOM, Util: Util, el: el, on: on, $: $,
+        MEDIA_STATUS: MEDIA_STATUS, RETRY_CONFIG: RETRY_CONFIG, MediaState: MediaState,
+        EditState: EditState, VideoState: VideoState, GlobalVid: GlobalVid,
+        Toast: Toast, Chrome: Chrome, Virtual: Virtual, ImageCard: ImageCard, EditMode: EditMode,
+        makeLoadingSpinner: makeLoadingSpinner, waitForMediaRetry: waitForMediaRetry,
+        resolveMediaRetry: resolveMediaRetry, beginCardRetry: beginCardRetry,
+        trySwapMediaType: trySwapMediaType, attachZoom: attachZoom, getMediaType: getMediaType
+      });
+    }
+
+    function load(name) {
+      if (instances[name]) return Promise.resolve(instances[name]);
+      if (inflight[name]) return inflight[name];
+      var p = new Promise(function (resolve, reject) {
+        function instantiate() {
+          try { instances[name] = factories[name](internals()); resolve(instances[name]); }
+          catch (e) { reject(e); }
+        }
+        if (factories[name]) { instantiate(); return; }        /* already evaluated (e.g. a test harness) */
+        var s = document.createElement('script');
+        s.src = manifest[name] || ('chunks/' + name + '.js');
+        s.async = true;
+        s.onload = function () {
+          if (factories[name]) instantiate();
+          else reject(new Error('chunk "' + name + '" did not register itself'));
+        };
+        s.onerror = function () { s.remove(); reject(new Error('chunk "' + name + '" failed to load')); };
+        document.head.appendChild(s);
+      });
+      inflight[name] = p;
+      p.then(null, function () { delete inflight[name]; });
+      return p;
+    }
+
+    /* The chunk's API if it is already running, else null (lets a caller skip
+       its "still loading" path when the code has in fact arrived). */
+    function peek(name) { return instances[name] || null; }
+
+    /* Start fetching a chunk now, ignoring failure — used on hover/focus of
+       the control that will need it, so the click itself finds it ready. */
+    function prefetch(name) { if (!instances[name]) load(name).then(null, function () {}); }
+
+    function failed(what) {
+      Toast.show('Could not load ' + what + '. Check your connection and try again.', 'err', 4500);
+    }
+
+    return { load: load, peek: peek, prefetch: prefetch, failed: failed };
+  })();
+
+  /* ════════════════════════════════════════════════════════
+     STORAGE + CONSENT
+
+     Bat-Viewer sets no cookies and sends nothing to any server. The only
+     thing it can keep on the device is the Night/Moon theme (plus a note
+     of the choice made in the banner), in localStorage — and the theme is
+     written there only after an explicit "Allow". Every key starts with
+     `bv-` so "Delete my data" can remove all of it.
+  ════════════════════════════════════════════════════════ */
+  var Store = (function () {
+    var PREFIX = 'bv-';
+    function area() { try { return window.localStorage || null; } catch (_) { return null; } }
+    function get(key) { try { var a = area(); return a ? a.getItem(key) : null; } catch (_) { return null; } }
+    function set(key, value) { try { var a = area(); if (!a) return false; a.setItem(key, value); return true; } catch (_) { return false; } }
+    function del(key) { try { var a = area(); if (a) a.removeItem(key); } catch (_) {} }
+    function clearAll() {
+      try {
+        var a = area();
+        if (!a) return;
+        var doomed = [], i, k;
+        for (i = 0; i < a.length; i++) { k = a.key(i); if (k && k.indexOf(PREFIX) === 0) doomed.push(k); }
+        for (i = 0; i < doomed.length; i++) del(doomed[i]);
+      } catch (_) {}
+    }
+    return { available: function () { return area() !== null; }, get: get, set: set, del: del, clearAll: clearAll };
+  })();
+
+  var Consent = (function () {
+    var KEY = 'bv-consent';
+    var value = Store.get(KEY);                       /* 'granted' | 'denied' | null (not asked yet) */
+    if (value !== 'granted' && value !== 'denied') value = null;
+    return {
+      decided: function () { return value !== null; },
+      granted: function () { return value === 'granted'; },
+      grant:   function () { value = 'granted'; Store.set(KEY, value); },
+      deny:    function () { value = 'denied';  Store.set(KEY, value); Store.del('bv-theme'); },
+      reset:   function () { value = null; }          /* the caller has already emptied storage */
+    };
+  })();
+
+  /* ════════════════════════════════════════════════════════
      THEME
   ════════════════════════════════════════════════════════ */
-  (function Theme() {
-    function apply(theme) {
-      DOM.html.setAttribute('data-theme', theme);
-      DOM.themeToggle.checked = (theme === 'moon');
-      DOM.themeLabel.textContent = theme === 'moon' ? '\uD83C\uDF15 Moon' : '\uD83C\uDF19 Night';
-      localStorage.setItem('bv-theme', theme);
+  var Theme = (function () {
+    function apply(theme, persist) {
+      var moon = theme === 'moon';
+      DOM.html.setAttribute('data-theme', moon ? 'moon' : 'night');
+      DOM.themeToggle.checked = moon;
+      DOM.themeIcon.textContent = moon ? '🌕' : '🌙';
+      DOM.themeName.textContent = moon ? 'Moon' : 'Night';
+      if (persist && Consent.granted()) Store.set('bv-theme', moon ? 'moon' : 'night');
     }
-    apply(localStorage.getItem('bv-theme') || 'night');
-    on(DOM.themeToggle, 'change', function () {
-      apply(DOM.themeToggle.checked ? 'moon' : 'night');
-    });
+    function current() { return DOM.html.getAttribute('data-theme'); }
+    apply(Store.get('bv-theme'), false);
+    on(DOM.themeToggle, 'change', function () { apply(DOM.themeToggle.checked ? 'moon' : 'night', true); });
+    return { apply: apply, current: current };
+  })();
+
+  /* ════════════════════════════════════════════════════════
+     CONSENT BANNER
+     Shown once, only if storage is usable and nothing has been chosen
+     yet. Both choices are one click and carry equal weight; the page
+     works fully either way and the banner never blocks anything.
+     "Privacy settings" in the footer brings it back.
+  ════════════════════════════════════════════════════════ */
+  var ConsentBanner = (function () {
+    var opener = null;
+    function show(fromUser) {
+      opener = fromUser ? document.activeElement : null;
+      DOM.consentBanner.hidden = false;
+      if (fromUser) DOM.consentDeny.focus();
+    }
+    function hide() {
+      var hadFocus = DOM.consentBanner.contains(document.activeElement);
+      DOM.consentBanner.hidden = true;
+      if (hadFocus) {
+        var back = opener && document.documentElement.contains(opener) ? opener : DOM.pageBody;
+        back.focus({ preventScroll: true });
+      }
+      opener = null;
+    }
+    function choose(allow) {
+      if (allow) { Consent.grant(); Store.set('bv-theme', Theme.current()); }
+      else       { Consent.deny(); }
+      hide();
+      Toast.show(allow ? 'Saved. Your theme will be remembered on this device.'
+                       : 'Okay. Nothing is saved; your theme resets when you reload.', 'ok', 4200);
+    }
+    on(DOM.consentAllow, 'click', function () { choose(true); });
+    on(DOM.consentDeny,  'click', function () { choose(false); });
+    if (Store.available() && !Consent.decided()) show(false);
+    return { show: show, hide: hide };
   })();
 
   /* ════════════════════════════════════════════════════════
      HELP TOOLTIP
   ════════════════════════════════════════════════════════ */
-  (function Help() {
+  var Help = (function () {
     var open = false;
+    function set(v) {
+      open = v;
+      DOM.helpTooltip.classList.toggle('visible', open);
+      DOM.helpBtn.setAttribute('aria-expanded', String(open));
+    }
     on(DOM.helpBtn, 'click', function (e) {
       e.stopPropagation();
-      open = !open;
-      DOM.helpTooltip.classList.toggle('visible', open);
+      set(!open);
     });
-    on(document, 'click', function () {
-      if (open) { open = false; DOM.helpTooltip.classList.remove('visible'); }
+    on(document, 'click', function (e) {
+      if (open && !DOM.helpTooltip.contains(e.target)) set(false);
     });
+    return { isOpen: function () { return open; }, close: function () { set(false); } };
   })();
 
   /* ════════════════════════════════════════════════════════
      COMMON NOTES  (global, session-only scratchpad — top bar)
-     ─ Fully separate from the per-card Notes feature above
-       (NoteState / .card-notes): this is one shared textarea,
-       not tied to any media URL.
-     ─ Static singleton modal, toggled via a CSS class only —
-       no DOM is created or destroyed on open/close, so repeated
-       clicks can't spawn duplicate instances.
-     ─ Value lives only in the textarea's in-memory DOM node:
-       never written to localStorage/sessionStorage/cookies/a
-       backend, so a reload clears it automatically.
+     ─ Fully separate from the per-card Notes feature (NoteState /
+       .card-notes): one shared textarea, not tied to any media URL.
+     ─ The dialog and its code live in chunks/common-notes.js and are
+       created the first time the button is used. Nothing is ever
+       written to storage, so a reload clears it.
   ════════════════════════════════════════════════════════ */
   var CommonNotes = (function () {
-    var open = false;
-    var lastFocus = null;
+    var api = null;
+    function prefetch() { Chunks.prefetch('common-notes'); }
+    on(DOM.commonNotesBtn, 'pointerenter', prefetch);
+    on(DOM.commonNotesBtn, 'focus', prefetch);
+    on(DOM.commonNotesBtn, 'click', function (e) {
+      e.stopPropagation();
+      if (api) { api.show(); return; }
+      Chunks.load('common-notes').then(function (a) { api = a; a.show(); },
+                                       function () { Chunks.failed('Common Notes'); });
+    });
+    return {
+      isOpen: function () { return !!api && api.isOpen(); },
+      hide:   function () { if (api) api.hide(); },
+      clear:  function () { if (api) api.clear(); }
+    };
+  })();
 
-    function isOpen() { return open; }
+  /* ════════════════════════════════════════════════════════
+     ROTATION FIT
+     A card's picture is rotated by turning its wrapper. Turned as it
+     is, the wrapper's box (as wide as the card) swings out of the
+     card: edit mode used to clip the picture, and once Done it lay
+     over the card's own buttons and its neighbours.
 
-    function show() {
-      if (open) return;               /* guard: never open a second time */
-      open = true;
-      lastFocus = document.activeElement;
-      DOM.cnOverlay.classList.add('visible');
-      DOM.cnOverlay.setAttribute('aria-hidden', 'false');
-      /* Defer focus one frame so the fade/scale-in transition isn't
-         interrupted by the browser's focus-triggered scroll-into-view. */
-      requestAnimationFrame(function () { DOM.cnTextarea.focus(); });
+     Now a rotated picture is treated as a picture of its new shape.
+     The natural image, turned by the angle, has a bounding box; that
+     box is shown as wide as the card allows and no taller than the
+     Image Size limit (exactly how an image of that shape is shown),
+     and the card makes room for it with vertical margins on the
+     wrapper. Nothing is clipped and nothing leaves the card, at any
+     angle, for images and videos alike.
+
+     Sizes need layout, so this runs again when the media loads, when
+     the card's width changes (columns, window, scrollbar) and when
+     the Image Size limit changes.
+  ════════════════════════════════════════════════════════ */
+  var RotateFit = (function () {
+    var tracked = new Set();          /* wrappers of rotated cards that are on the page */
+    var frame = 0;
+    var ro = typeof ResizeObserver === 'function' ? new ResizeObserver(refreshSoon) : null;
+
+    function mediaOf(wrap) { return wrap.querySelector('.card-img, .card-video'); }
+
+    /* The Image Size limit in pixels (Infinity for "Max"). applySize() keeps it in
+       --card-max-h as px or vh. While a card is being edited the Edit panel may lower it for
+       that card (--edit-max-h on the card) so the whole card fits above the panel. */
+    function cap(wrap) {
+      var v = (DOM.gallery.style.getPropertyValue('--card-max-h') || '').trim();
+      var n = parseFloat(v);
+      var limit = !(n > 0) ? Infinity : (/vh$/.test(v) ? n * window.innerHeight / 100 : n);
+      var card = wrap.closest ? wrap.closest('.card') : null;
+      var e = card ? parseFloat(card.style.getPropertyValue('--edit-max-h')) : NaN;
+      return e > 0 ? Math.min(limit, e) : limit;
     }
 
-    function hide() {
-      if (!open) return;
-      open = false;
-      DOM.cnOverlay.classList.remove('visible');
-      DOM.cnOverlay.setAttribute('aria-hidden', 'true');
-      if (lastFocus && typeof lastFocus.focus === 'function') lastFocus.focus();
-      lastFocus = null;
+    /* Back to the card's normal layout. */
+    function clear(wrap, media) {
+      var st = wrap.style;
+      st.transform = st.width = st.marginTop = st.marginBottom = st.marginLeft = st.marginRight = '';
+      if (media) media.style.maxHeight = '';
     }
 
-    on(DOM.commonNotesBtn, 'click', function (e) { e.stopPropagation(); show(); });
-    on(DOM.cnClose, 'click', hide);
-    /* Click on the dimmed backdrop (not the modal card itself) closes it. */
-    on(DOM.cnOverlay, 'click', function (e) {
-      if (e.target === DOM.cnOverlay) hide();
-    });
-    on(DOM.cnClearBtn, 'click', function () {
-      DOM.cnTextarea.value = '';
-      DOM.cnTextarea.focus();
-    });
+    /* Rotated, but the picture's size is not known yet (still loading): just turn it. */
+    function plain(wrap, media, deg) {
+      clear(wrap, media);
+      wrap.style.transform = 'rotate(' + deg + 'deg)';
+    }
 
-    return { isOpen: isOpen, show: show, hide: hide };
+    function fit(wrap) {
+      var deg = wrap._deg || 0, media = mediaOf(wrap), box = wrap.parentNode;
+      if (!deg || !media) return;
+      if (box && ro && wrap._fitBox !== box) {
+        if (wrap._fitBox) ro.unobserve(wrap._fitBox);
+        wrap._fitBox = box;
+        ro.observe(box);
+      }
+      var nw = media.naturalWidth  || media.videoWidth  || 0;
+      var nh = media.naturalHeight || media.videoHeight || 0;
+      var wb = box ? box.clientWidth : 0;
+      if (!nw || !nh || !wb) { plain(wrap, media, deg); return; }
+
+      var a = deg * Math.PI / 180, c = Math.abs(Math.cos(a)), s = Math.abs(Math.sin(a));
+      var wn = nw * c + nh * s, hn = nw * s + nh * c;   /* the natural picture, turned: its bounding box */
+      var wd = Math.min(wb, cap(wrap) * wn / hn);          /* shown as wide as the card allows, no taller than the limit */
+      var k  = wd / wn;
+      var cw = nw * k;                                 /* the picture's own width, before it is turned */
+      var hd = hn * k;                                 /* the room the turned picture needs */
+
+      /* The wrapper is laid out no wider than the card and scaled up to its real size by the
+         transform. (A layout box wider than the card — a landscape picture turned upright is
+         wider than it is shown — would stretch a one-column grid track, which widens the card,
+         which asks for a still wider picture, and so on without end.) */
+      var w0 = Math.min(wb, cw);                       /* layout width */
+      var h0 = w0 * nh / nw;                           /* layout height: the picture keeps its shape */
+      var f  = cw / w0;                                /* 1 unless the picture is shown wider than it is laid out */
+
+      var st = wrap.style;
+      st.width = w0.toFixed(2) + 'px';
+      st.marginLeft = st.marginRight = 'auto';
+      st.marginTop = st.marginBottom = ((hd - h0) / 2).toFixed(2) + 'px';
+      st.transform = 'rotate(' + deg + 'deg)' + (f > 1.0005 ? ' scale(' + f.toFixed(5) + ')' : '');
+      media.style.maxHeight = 'none';                  /* the size is set above; the limit is already applied */
+    }
+
+    function release(wrap) {
+      tracked.delete(wrap);
+      wrap._deg = 0;
+      if (wrap._fitBox && ro) ro.unobserve(wrap._fitBox);
+      wrap._fitBox = null;
+    }
+
+    function refreshAll() {
+      tracked.forEach(function (wrap) {
+        if (!wrap.isConnected) { release(wrap); return; }   /* its card was torn down */
+        fit(wrap);
+      });
+    }
+
+    function refreshSoon() {
+      if (frame) return;
+      frame = requestAnimationFrame(function () { frame = 0; refreshAll(); });
+    }
+
+    /* Turn a card's wrapper by `deg` (0 puts it back). */
+    function set(wrap, deg) {
+      var media = mediaOf(wrap);
+      deg = deg || 0;
+      if (!deg) { release(wrap); clear(wrap, media); return; }
+      tracked.forEach(function (w) { if (!w.isConnected) release(w); });   /* never keep a torn-down card */
+      wrap._deg = deg;
+      tracked.add(wrap);
+      if (media && !wrap._fitBound) {
+        wrap._fitBound = true;
+        media.addEventListener('load', function () { fit(wrap); });
+        media.addEventListener('loadedmetadata', function () { fit(wrap); });
+      }
+      fit(wrap);
+    }
+
+    window.addEventListener('resize', refreshSoon);
+    return { set: set, release: release, refreshSoon: refreshSoon };
   })();
 
   /* ════════════════════════════════════════════════════════
      SIZE PRESETS
+     applySize() is O(1): it writes three CSS variables on the gallery and
+     the stylesheet does the rest (.card-img/.card-video max-height,
+     .vslot min-height, loading-skeleton height). It used to touch every
+     card and slot on every slider tick.
   ════════════════════════════════════════════════════════ */
   var SIZE_PRESETS = [
     { label: 'Tiny',      cols: 5, maxH: '120px' },
@@ -404,17 +781,16 @@
 
   function applySize(v) {
     var p = SIZE_PRESETS[Util.clamp(v - 1, 0, 9)];
-    State.currentMaxH = p.maxH;
     DOM.sizeBadge.textContent = p.label;
+    DOM.sizer.setAttribute('aria-valuetext', p.label);
     DOM.gallery.style.gridTemplateColumns =
-      p.cols === 1 ? '1fr' : 'repeat(' + p.cols + ',minmax(0,1fr))';
-    var slotMin = p.maxH === 'none' ? '200px' : p.maxH;
-    DOM.gallery.querySelectorAll('.card-img,.card-video')
-      .forEach(function (m) { m.style.maxHeight = p.maxH; });
-    DOM.gallery.querySelectorAll('.vslot')
-      .forEach(function (s) { s.style.minHeight = slotMin; });
+      'repeat(' + p.cols + ',minmax(0,1fr))';       /* never wider than the page, even for one column */
+    DOM.gallery.style.setProperty('--card-max-h', p.maxH);
+    DOM.gallery.style.setProperty('--slot-min-h', p.maxH === 'none' ? '200px' : p.maxH);
+    DOM.gallery.style.setProperty('--skeleton-h', p.maxH === 'none' ? '160px' : 'min(160px,' + p.maxH + ')');
+    RotateFit.refreshSoon();                       /* rotated pictures are fitted to the new limit */
   }
-  on(DOM.sizer, 'input', function () { applySize(parseInt(DOM.sizer.value, 10)); });
+  on(DOM.sizer, 'input', Util.rafThrottle(function () { applySize(parseInt(DOM.sizer.value, 10)); }));
   applySize(parseInt(DOM.sizer.value, 10));
 
   /* ════════════════════════════════════════════════════════
@@ -430,10 +806,13 @@
   function getScrollPreset() {
     return SCROLL_PRESETS[Util.clamp(parseInt(DOM.scrollSpeed.value, 10) - 1, 0, 4)];
   }
-  on(DOM.scrollSpeed, 'input', function () {
-    DOM.scrollBadge.textContent = getScrollPreset().label;
-  });
-  DOM.scrollBadge.textContent = getScrollPreset().label;
+  function syncScrollBadge() {
+    var label = getScrollPreset().label;
+    DOM.scrollBadge.textContent = label;
+    DOM.scrollSpeed.setAttribute('aria-valuetext', label);
+  }
+  on(DOM.scrollSpeed, 'input', syncScrollBadge);
+  syncScrollBadge();
 
   function zoomOn() { return DOM.zoomEnabled.checked; }
 
@@ -485,9 +864,32 @@
 
   /* Extension/hint-based detection only — no network calls, no
      overrides. Returns 'video' | 'image' | null (null = genuinely
-     inconclusive, caller decides the default + swap eligibility). */
+     inconclusive, caller decides the default + swap eligibility).
+
+     The result depends only on the URL string, and getMediaType() asks
+     about the same URLs again and again (every card build, every
+     renumber after a removal, the bulk-load summary), so answers are
+     memoized. The memo is emptied by Virtual.clear() and capped so a long
+     session can't grow it without bound. */
+  var DETECT_CACHE_MAX = 5000;
+  var detectCache = Object.create(null), detectCacheSize = 0;
   function detectMediaType(url) {
     if (!url) return null;
+    var hit = detectCache[url];
+    if (hit !== undefined) return hit;
+    var found = detectMediaTypeUncached(url);
+    if (detectCacheSize >= DETECT_CACHE_MAX) { detectCache = Object.create(null); detectCacheSize = 0; }
+    detectCache[url] = found;
+    detectCacheSize++;
+    return found;
+  }
+  function resetDetectCache() { detectCache = Object.create(null); detectCacheSize = 0; }
+
+  function detectMediaTypeUncached(url) {
+    /* data:image/png;base64,… and data:video/mp4;… carry their own type
+       (this is what the video "capture frame" button produces). */
+    var dm = /^data:(image|video)\//i.exec(url);
+    if (dm) return dm[1].toLowerCase();
     var pathname = url, search = '';
     try {
       var base = (typeof window !== 'undefined' && window.location) ? window.location.href : undefined;
@@ -546,6 +948,10 @@
     if (State.imageOverrides.has(url)) return 'image';
     var detected = detectMediaType(url);
     if (detected) return detected;
+    /* A content-type probe already answered for this link (and the answer
+       outlives Clear — it is a fact about the link, not about the gallery). */
+    var probed = ProbeCache[url];
+    if (probed === 'video' || probed === 'image') return probed;
     /* Genuinely inconclusive (no extension, no MIME/filename hint yet).
        This app started life as an image gallery and most extensionless
        S3 keys in practice are images, so default there. Crucially this
@@ -613,7 +1019,9 @@
   function trySwapMediaType(url, card, box, zoom, overrideSet, buildOther) {
     if (State.fallbackAttempted.has(url)) return false;
     var parentSlot = card.closest('.vslot');
-    if (!parentSlot) return false;
+    /* A card whose slot has already left the page (cleared or removed) must not
+       be rebuilt — that would load media for a link nobody is looking at. */
+    if (!parentSlot || !parentSlot.isConnected) return false;
     State.fallbackAttempted.add(url);
     var firstType = card.classList.contains('card-video-card') ? 'video' : 'image';
     var confident = isConfidentMediaType(url);
@@ -653,30 +1061,75 @@
      the existing one-time swap-on-error fallback — no error is ever
      surfaced to the user and rendering is never blocked on this.
   ════════════════════════════════════════════════════════ */
-  var _probedUrls = new Set();
-  function probeContentType(idx, url) {
-    if (_probedUrls.has(url)) return;
-    _probedUrls.add(url);
-    if (typeof fetch !== 'function') return;
+  /* Answers already obtained, keyed by link: 'video' | 'image' | 'none'
+     ('none' = asked, nothing usable came back — don't ask again). Kept
+     across Clear on purpose: re-loading the same links needs no new
+     requests, and getMediaType() consults it so the card is built as the
+     right type the first time. */
+  var ProbeCache = Object.create(null);
 
+  /* Probes go through a small bounded pool instead of one request per
+     activated card (a fast scroll through 1,000 extensionless links used to
+     fire hundreds of simultaneous HEADs, competing with the media itself
+     for the browser's connections). Newest first — that is the card
+     nearest the viewport — and a job whose card has scrolled away or been
+     removed while it waited is simply dropped. */
+  var PROBE_CONCURRENCY = 4, PROBE_TIMEOUT_MS = 6000;
+  var probeQueue  = [];                        /* jobs waiting for a free connection */
+  var probeQueued = Object.create(null);       /* url -> true while queued or in flight */
+  var probeActive = 0;
+
+  function probeWanted(job) {
+    return State.allUrls[job.idx] === job.url && State.activeSet.has(State.slots[job.idx]);
+  }
+  function applyProbeResult(idx, url, type) {
+    if (type === 'video') { State.imageOverrides.delete(url); State.videoOverrides.add(url); }
+    else                  { State.videoOverrides.delete(url); State.imageOverrides.add(url); }
+    if (State.allUrls[idx] === url) swapCardType(idx, type);
+  }
+  function runProbe(job) {
+    probeActive++;
+    var done = false;
     var ac = (typeof AbortController !== 'undefined') ? new AbortController() : null;
-    var tid = setTimeout(function () { if (ac) ac.abort(); }, 6000);
-
-    fetch(url, { method: 'HEAD', cache: 'force-cache', signal: ac ? ac.signal : undefined })
+    var tid = setTimeout(function () { if (ac) ac.abort(); }, PROBE_TIMEOUT_MS);
+    function finish(type) {
+      if (done) return;
+      done = true;
+      clearTimeout(tid);
+      ProbeCache[job.url] = type || 'none';
+      delete probeQueued[job.url];
+      probeActive--;
+      if (type) applyProbeResult(job.idx, job.url, type);
+      pumpProbes();
+    }
+    /* credentials:'omit' — the privacy policy promises this request carries no cookies. */
+    fetch(job.url, { method: 'HEAD', cache: 'force-cache', credentials: 'omit', signal: ac ? ac.signal : undefined })
       .then(function (res) {
-        clearTimeout(tid);
         var ct = res && res.headers && res.headers.get && res.headers.get('content-type');
-        if (!ct) return;
-        ct = ct.toLowerCase();
-        var type = null;
-        if (ct.indexOf('video/') === 0) type = 'video';
-        else if (ct.indexOf('image/') === 0) type = 'image';
-        if (!type) return;
-        if (type === 'video') { State.imageOverrides.delete(url); State.videoOverrides.add(url); }
-        else                  { State.videoOverrides.delete(url); State.imageOverrides.add(url); }
-        if (State.allUrls[idx] === url) swapCardType(idx, type);
+        ct = ct ? ct.toLowerCase() : '';
+        finish(ct.indexOf('video/') === 0 ? 'video' : ct.indexOf('image/') === 0 ? 'image' : null);
       })
-      .catch(function () { clearTimeout(tid); /* CORS/network/timeout — silently keep current guess */ });
+      .catch(function () { finish(null); /* CORS/network/timeout — silently keep the current guess */ });
+  }
+  function pumpProbes() {
+    while (probeActive < PROBE_CONCURRENCY && probeQueue.length) {
+      var job = probeQueue.pop();
+      if (probeWanted(job)) runProbe(job);
+      else delete probeQueued[job.url];        /* scrolled away while waiting; asked again if it returns */
+    }
+  }
+  function dropQueuedProbes() {
+    for (var i = 0; i < probeQueue.length; i++) delete probeQueued[probeQueue[i].url];
+    probeQueue.length = 0;
+  }
+  function probeContentType(idx, url) {
+    if (ProbeCache[url] || probeQueued[url]) return;
+    /* data: and blob: links need no probe (and the CSP's connect-src is
+       limited to http(s) anyway). */
+    if (typeof fetch !== 'function' || !/^https?:/i.test(url)) return;
+    probeQueued[url] = true;
+    probeQueue.push({ idx: idx, url: url });
+    pumpProbes();
   }
 
   function parseUrls(txt) {
@@ -691,12 +1144,27 @@
       return u.protocol === 'http:' || u.protocol === 'https:' || u.protocol === 'data:' || u.protocol === 'blob:';
     } catch (_) { return false; }
   }
-  function refreshCount() { DOM.gCount.textContent = State.allUrls.length; }
+  function refreshCount() {
+    DOM.gCount.textContent = State.allUrls.length;
+    Pager.updateUI();
+  }
 
-  on(DOM.bulkArea, 'input', function () {
-    var n = parseUrls(DOM.bulkArea.value).length;
-    DOM.bulkTally.innerHTML = '<b>' + n + '</b> URL' + (n !== 1 ? 's' : '');
-  });
+  /* The "N URLs" tally under the box. Re-parsing a 1,000-line paste on every
+     keystroke is wasted work, so input is debounced (a paste still updates
+     after one short pause) and the DOM is only touched when the number
+     actually changes. */
+  var shownTally = -1;
+  function setTally(n) {
+    if (n === shownTally) return;
+    shownTally = n;
+    var b = el('b');
+    b.textContent = n;
+    DOM.bulkTally.textContent = '';
+    DOM.bulkTally.appendChild(b);
+    DOM.bulkTally.appendChild(document.createTextNode(' URL' + (n !== 1 ? 's' : '')));
+  }
+  var updateTally = Util.debounce(function () { setTally(parseUrls(DOM.bulkArea.value).length); }, 150);
+  on(DOM.bulkArea, 'input', updateTally);
 
   /* ════════════════════════════════════════════════════════
      PERSISTED PER-URL STATE
@@ -722,8 +1190,10 @@
       if (!media || !wrap) return;
       media.style.filter = (s.brightness !== 1 || s.contrast !== 1)
         ? 'brightness(' + s.brightness + ') contrast(' + s.contrast + ')' : '';
-      wrap.style.transform = s.rotation !== 0 ? 'rotate(' + s.rotation + 'deg)' : '';
-    }
+      RotateFit.set(wrap, s.rotation);
+    },
+    /* Rotation only (cards restoring their saved edit when they are built). */
+    rotate: function (wrap, deg) { RotateFit.set(wrap, deg); }
   };
 
   var VideoState = {
@@ -778,75 +1248,28 @@
   };
 
   /* ════════════════════════════════════════════════════════
-     EDIT MODE  (singleton — lazy panel wire-up)
+     EDIT MODE  (singleton — loads on first use)
+
+     The panel's markup and code live in chunks/edit-mode.js. This
+     stand-in keeps the four-method contract that the cards, Keyboard
+     and Virtual already use (enter / exit / reset / isActive) and
+     fetches the chunk the first time an Edit button is pressed. Until
+     then there is nothing to exit, so exit/reset/isActive are no-ops.
   ════════════════════════════════════════════════════════ */
   var EditMode = (function () {
-    var panel, activeCard = null, activeUrl = null;
-    var saved = null, live = null;
-    var refs  = null, ready = false;
-
-    function ensure() {
-      if (ready) return;
-      ready = true;
-      panel = $('editPanel');
-      refs = {
-        b: $('epBrightness'), c: $('epContrast'), r: $('epRotate'),
-        bv: $('epBrightnessVal'), cv: $('epContrastVal'), rv: $('epRotateVal')
-      };
-      on(refs.b, 'input', function () { live.brightness = refs.b.value / 100; refs.bv.textContent = refs.b.value + '%'; preview(); });
-      on(refs.c, 'input', function () { live.contrast   = refs.c.value / 100; refs.cv.textContent = refs.c.value + '%'; preview(); });
-      on(refs.r, 'input', function () { live.rotation   = parseInt(refs.r.value, 10); refs.rv.textContent = refs.r.value + '\u00b0'; preview(); });
-      on($('epRotCCW'), 'click', function () { live.rotation = normalise(live.rotation - 90); syncRot(); preview(); });
-      on($('epRotCW'),  'click', function () { live.rotation = normalise(live.rotation + 90); syncRot(); preview(); });
-      on($('epReset'),  'click', resetLive);
-      on($('epCancel'), 'click', function () { exit(false); });
-      on($('epDone'),   'click', function () { exit(true);  });
-      on($('epClose'),  'click', function () { exit(false); });
-    }
-    function normalise(d) { while (d > 180) d -= 360; while (d < -180) d += 360; return d; }
-    function syncRot()   { refs.r.value = live.rotation; refs.rv.textContent = live.rotation + '\u00b0'; }
-    function preview()   { if (activeCard) EditState.applyTo(activeCard, live); }
-    function resetLive() {
-      live = { brightness: 1, contrast: 1, rotation: 0 };
-      refs.b.value = 100; refs.bv.textContent = '100%';
-      refs.c.value = 100; refs.cv.textContent = '100%';
-      refs.r.value = 0;   refs.rv.textContent = '0\u00b0';
-      preview();
-    }
-    function populate(s) {
-      var b = Math.round(s.brightness * 100), c = Math.round(s.contrast * 100);
-      refs.b.value = b; refs.bv.textContent = b + '%';
-      refs.c.value = c; refs.cv.textContent = c + '%';
-      refs.r.value = s.rotation; refs.rv.textContent = s.rotation + '\u00b0';
-    }
-    function enter(card, url) {
-      if (activeCard === card) return;
-      if (activeCard) exit(false);
-      ensure();
-      activeCard = card; activeUrl = url;
-      saved = EditState.get(url);
-      live  = { brightness: saved.brightness, contrast: saved.contrast, rotation: saved.rotation };
-      populate(live);
-      panel.classList.add('visible');
-      panel.setAttribute('aria-hidden', 'false');
-      document.body.classList.add('edit-active');
-      card.classList.add('editing');
-    }
-    function exit(apply) {
-      if (!activeCard) return;
-      if (apply) { EditState.set(activeUrl, live); EditState.applyTo(activeCard, live); }
-      else       { EditState.applyTo(activeCard, saved); }
-      activeCard.classList.remove('editing');
-      document.body.classList.remove('edit-active');
-      panel.classList.remove('visible');
-      panel.setAttribute('aria-hidden', 'true');
-      activeCard = activeUrl = saved = live = null;
+    var api = null;
+    function ready(fn) {
+      if (api) { fn(api); return; }
+      Chunks.load('edit-mode').then(function (a) { api = a; fn(a); },
+                                    function () { Chunks.failed('the editor'); });
     }
     return {
-      enter   : enter,
-      exit    : exit,
-      reset   : function () { if (activeCard) resetLive(); },
-      isActive: function () { return activeCard !== null; }
+      enter   : function (card, url) {
+        ready(function (a) { if (document.documentElement.contains(card)) a.enter(card, url); });
+      },
+      exit    : function (apply) { if (api) api.exit(apply); },
+      reset   : function () { if (api) api.reset(); },
+      isActive: function () { return !!api && api.isActive(); }
     };
   })();
 
@@ -857,11 +1280,24 @@
      image and video card factories.
   ════════════════════════════════════════════════════════ */
   var Chrome = (function () {
+    /* "Image 5" / "Video 5 [VIDEO]" — also used to renumber after a removal. */
+    function setCardNum(numEl, num, type) {
+      numEl.textContent = (type === 'video' ? 'Video ' : 'Image ') + num;
+      if (type === 'video') {
+        var tag = el('span', 'media-tag');
+        tag.textContent = 'VIDEO';
+        numEl.appendChild(document.createTextNode(' '));
+        numEl.appendChild(tag);
+      }
+    }
+
     function header(num, type) {
       var hdr = el('div', 'card-header');
-      var lbl = type === 'video' ? 'Video ' : 'Image ';
-      var tag = type === 'video' ? ' <span class="media-tag">VIDEO</span>' : '';
-      var numEl = el('span', 'card-num'); numEl.innerHTML = lbl + num + tag;
+      var numEl = el('span', 'card-num'); setCardNum(numEl, num, type);
+      /* The card's buttons/note box point at this with aria-describedby, so
+         "Remove" is announced as "Remove, Image 5" — and stays right when
+         removing an earlier card renumbers this one. */
+      numEl.id = Util.uid('bvn');
       var dimsEl = el('span', 'card-dims');
       hdr.appendChild(numEl); hdr.appendChild(dimsEl);
       return { hdr: hdr, dimsEl: dimsEl, numEl: numEl };
@@ -877,27 +1313,42 @@
 
     function makeBtn(cls, label, title) {
       var b = el('button', cls); b.textContent = label;
+      b.type = 'button';
       if (title) b.title = title;
       return b;
     }
 
     /* Shared "\u26a0 Could not load ..." panel + Retry button, used by both
-       ImageCard and VideoCard failed states (previously duplicated). */
-    function buildErrorView(box, message, url, onRetryClick) {
+       ImageCard and VideoCard failed states (previously duplicated).
+       The link is pasted by the user, so it goes in as TEXT \u2014 it used to be
+       concatenated into innerHTML, which let a crafted link inject markup.
+       `describedBy` (the card's number element id) lets a screen reader say
+       which card the Retry button belongs to. */
+    function buildErrorView(box, message, url, onRetryClick, describedBy) {
       var errDiv = el('div', 'card-err');
-      errDiv.innerHTML = '\u26a0 ' + message + '<br>' +
-        '<small style="opacity:.4;word-break:break-all;">' + url + '</small>';
-      var retryBtn = makeBtn('card-retry-btn', '\u21ba Retry');
+      errDiv.appendChild(document.createTextNode('\u26a0 ' + message));
+      var small = el('small', 'card-err-url');
+      small.textContent = url;
+      errDiv.appendChild(small);
+      var retryBtn = makeBtn('card-retry-btn', '');
+      var glyph = el('span'); glyph.setAttribute('aria-hidden', 'true'); glyph.textContent = '\u21ba';
+      retryBtn.appendChild(glyph);
+      retryBtn.appendChild(document.createTextNode(' Retry'));
+      if (describedBy) retryBtn.setAttribute('aria-describedby', describedBy);
       on(retryBtn, 'click', onRetryClick);
       errDiv.appendChild(retryBtn);
       box.appendChild(errDiv);
       return errDiv;
     }
 
-    /* Builds Copy/Edit/Remove toolbar.
-       opts: { url, onCopyLink, onEdit, onRemove } */
+    /* Builds Copy/Edit/Note/Remove toolbar.
+       opts: { url, describedBy, onCopyLink, onEdit, onNote, onRemove }
+       describedBy = id of the card's number element (see header()). */
     function toolbar(opts) {
       var bar = el('div', 'card-toolbar');
+      /* Screen-reader confirmation for Copy — the button's own text change is silent. */
+      var srStatus = el('span', 'sr-only');
+      srStatus.setAttribute('role', 'status');
 
       var copyBtn = makeBtn('tcopy', 'Copy Link');
       var copyTid = null;
@@ -908,11 +1359,13 @@
         var text  = (typeof link === 'object') ? link.text : link;
         Util.copyToClipboard(text).then(function () {
           copyBtn.textContent = label;
+          srStatus.textContent = 'Link copied';
           copyBtn.classList.remove('err');
           copyBtn.classList.add('ok');
           clearTimeout(copyTid);
           copyTid = setTimeout(function () {
             copyBtn.textContent = 'Copy Link';
+            srStatus.textContent = '';
             copyBtn.classList.remove('ok');
           }, 1700);
         }).catch(function () {
@@ -932,6 +1385,10 @@
 
       var editBtn = makeBtn('tedit', 'Edit');
       on(editBtn, 'click', function () { opts.onEdit && opts.onEdit(editBtn); });
+      /* The editor's code is fetched on first use; start as soon as the button is approached. */
+      function prefetchEditor() { Chunks.prefetch('edit-mode'); }
+      on(editBtn, 'pointerenter', prefetchEditor);
+      on(editBtn, 'focus', prefetchEditor);
 
       var noteBtn = makeBtn('tnote', 'Note', 'Add a note for this item (kept while you scroll, cleared on page reload)');
       on(noteBtn, 'click', function (ev) {
@@ -942,20 +1399,24 @@
       var removeBtn = makeBtn('tremove', 'Remove');
       on(removeBtn, 'click', function () { opts.onRemove && opts.onRemove(); });
 
-      bar.appendChild(copyBtn);
-      bar.appendChild(editBtn);
-      bar.appendChild(noteBtn);
-      bar.appendChild(removeBtn);
+      var all = [copyBtn, editBtn, noteBtn, removeBtn];
+      all.forEach(function (b) {
+        if (opts.describedBy) b.setAttribute('aria-describedby', opts.describedBy);
+        bar.appendChild(b);
+      });
+      bar.appendChild(srStatus);
       return bar;
     }
 
     /* Collapsible per-card Notes panel — textarea + char counter + Clear.
-       opts: url (State.noteStates key), noteBtn (toolbar button kept in
-       sync so a card shows it has a note even while the panel is closed).
+       url (State.noteStates key), noteBtn (toolbar button kept in sync so a
+       card shows it has a note even while the panel is closed), describedBy
+       (id of the card's number element, so a screen reader hears which card
+       the note box and its Clear button belong to).
        Text is written to State.noteStates on every keystroke (not just
        blur) because the gallery is virtualized: a card can be torn down
        the instant it scrolls out of view, mid-keystroke, with no warning. */
-    function notesSection(url, noteBtn) {
+    function notesSection(url, noteBtn, describedBy) {
       var wrap = el('div', 'card-notes hide');
 
       var head = el('div', 'card-notes-head');
@@ -963,9 +1424,12 @@
       var clearBtn = makeBtn('card-notes-clear hide', 'Clear', 'Clear this note');
       clearBtn.type = 'button';
       head.appendChild(clearBtn);
+      if (describedBy) clearBtn.setAttribute('aria-describedby', describedBy);
 
       var ta = el('textarea', 'card-notes-input');
       ta.placeholder = 'Add a note\u2026 (cleared on page reload)';
+      ta.setAttribute('aria-label', 'Note');
+      if (describedBy) ta.setAttribute('aria-describedby', describedBy);
       ta.maxLength = NOTE_MAX_LEN;
       ta.spellcheck = true;
       ta.value = NoteState.get(url);
@@ -1013,6 +1477,7 @@
       var parentSlot = card.closest('.vslot');
       var idx = parentSlot ? parseInt(parentSlot.dataset.idx, 10) : fallbackIdx;
       var url = State.allUrls[idx];
+      var hadFocus = card.contains(document.activeElement);
 
       if (typeof beforeRemove === 'function') beforeRemove();
       if (card.classList.contains('editing')) EditMode.exit(false);
@@ -1030,15 +1495,17 @@
       for (var j = idx; j < State.slots.length; j++) {
         State.slots[j].dataset.idx = String(j);
         var cn = State.slots[j].querySelector('.card-num');
-        if (cn) {
-          var jt = getMediaType(State.allUrls[j]);
-          var lbl = jt === 'video' ? 'Video ' : 'Image ';
-          var tag = jt === 'video' ? ' <span class="media-tag">VIDEO</span>' : '';
-          cn.innerHTML = lbl + (j + 1) + tag;
-        }
+        if (cn) setCardNum(cn, j + 1, getMediaType(State.allUrls[j]));
       }
       refreshCount();
       card.classList.add('out');
+      /* A keyboard user who pressed Remove would otherwise lose their place when
+         the card vanishes: hand focus to the card that takes its spot. */
+      if (hadFocus) {
+        var next = State.slots[idx] || State.slots[idx - 1];
+        var target = next && next.querySelector('.card-toolbar button');
+        (target || DOM.gallery).focus({ preventScroll: true });
+      }
       setTimeout(function () {
         if (State.observer) State.observer.unobserve(removedSlot);
         removedSlot.remove();
@@ -1051,6 +1518,8 @@
     function zoomOverlay(box) {
       var badge = el('div', 'zoom-badge');
       var hint  = el('div', 'zoom-hint');
+      badge.setAttribute('aria-hidden', 'true');      /* visual-only overlays */
+      hint.setAttribute('aria-hidden', 'true');
       hint.textContent = 'Scroll\u2022zoom    Drag\u2022pan    Dbl-click\u2022reset';
       box.appendChild(badge); box.appendChild(hint);
       return { badge: badge, hint: hint };
@@ -1059,12 +1528,15 @@
     return {
       header: header, urlRow: urlRow, toolbar: toolbar, removeCard: removeCard,
       makeBtn: makeBtn, buildErrorView: buildErrorView, zoomOverlay: zoomOverlay,
-      notesSection: notesSection
+      notesSection: notesSection, setCardNum: setCardNum
     };
   })();
 
   /* ════════════════════════════════════════════════════════
      VIRTUAL GALLERY ENGINE
+     A slot is a cheap placeholder; the IntersectionObserver turns the
+     slots near the viewport into real cards and back again (activate /
+     deactivate), so only a few dozen cards ever hold live media.
   ════════════════════════════════════════════════════════ */
   var Virtual = (function () {
     function makeUrlLabel(url) {
@@ -1074,17 +1546,18 @@
     }
     function makeSlot(i) {
       var slot = el('div', 'vslot');
-      slot.style.minHeight = (State.currentMaxH === 'none' ? '200px' : State.currentMaxH);
+      slot.setAttribute('role', 'listitem');        /* #gallery is role="list" */
       slot.dataset.idx = String(i);
       slot.appendChild(makeUrlLabel(State.allUrls[i]));
-      return slot;
+      return slot;                                  /* its height comes from --slot-min-h (see applySize) */
     }
     function activate(slot) {
       if (State.activeSet.has(slot)) return;
       var i = parseInt(slot.dataset.idx, 10);
       if (i >= State.allUrls.length) return;
       State.activeSet.add(slot);
-      slot.innerHTML = '';
+      slot.classList.add('is-active');
+      slot.textContent = '';
       var url = State.allUrls[i];
       if (!State.videoOverrides.has(url) && !State.imageOverrides.has(url) && !isConfidentMediaType(url)) {
         probeContentType(i, url);
@@ -1100,18 +1573,20 @@
        delete/clear/build/re-add sequence inline. */
     function rebuildSlot(slot, idx, buildFn) {
       State.activeSet.delete(slot);
-      slot.innerHTML = '';
+      slot.textContent = '';
       slot.appendChild(buildFn(idx));
+      slot.classList.add('is-active');
       State.activeSet.add(slot);
     }
     function deactivate(slot) {
       if (!State.activeSet.has(slot)) return;
       State.activeSet.delete(slot);
+      slot.classList.remove('is-active');
       var box = slot.querySelector('.card-img-box');
       if (box && box._destroy) box._destroy();
       slot.querySelectorAll('img').forEach(function (img) { img.src = ''; });
       slot.querySelectorAll('video').forEach(Util.unloadVideo);
-      slot.innerHTML = '';
+      slot.textContent = '';
       var i = parseInt(slot.dataset.idx, 10);
       if (i < State.allUrls.length) slot.appendChild(makeUrlLabel(State.allUrls[i]));
     }
@@ -1124,49 +1599,129 @@
          "load everything") so we keep scaling to 1,000+ media items
          without exhausting memory or sockets. Inactive slots fully unload
          their <video src> in deactivate() once they scroll back out of
-         this window. */
+         this window.
+         ONE observer serves both jobs: it also watches the page-end sentinel
+         (Pager), which asks for the next page when it comes within the same
+         two-screen margin. */
       State.observer = new IntersectionObserver(function (entries) {
         entries.forEach(function (e) {
+          if (e.target === DOM.gallerySentinel) { if (e.isIntersecting) Pager.onSentinel(); return; }
           if (e.isIntersecting) activate(e.target);
           else                  deactivate(e.target);
         });
       }, { root: null, rootMargin: '200% 0px 200% 0px', threshold: 0 });
       State.slots.forEach(function (s) { State.observer.observe(s); });
+      Pager.arm();
     }
     function clear() {
       if (State.observer) { State.observer.disconnect(); State.observer = null; }
+      dropQueuedProbes();
       if (EditMode.isActive()) EditMode.exit(false);
+      /* Tear every live card down the proper way first. Blanking an <img> fires an
+         `error` event a moment later; the card's own _destroy() is what tells its
+         handler to ignore that, so without it each cleared image could start the
+         image->video fallback on a card that no longer exists (a wasted request
+         and a "failed to load" warning per image). It also drops each card's
+         zoom listener on the page-wide Zoom switch. */
+      State.activeSet.forEach(function (slot) {
+        var box = slot.querySelector('.card-img-box');
+        if (box && box._destroy) box._destroy();
+      });
       DOM.gallery.querySelectorAll('img').forEach(function (img) { img.src = ''; });
       DOM.gallery.querySelectorAll('video').forEach(Util.unloadVideo);
-      DOM.gallery.innerHTML = '';
+      DOM.gallery.textContent = '';
       State.allUrls = []; State.slots = []; State.activeSet = new Set();
+      State.hoveredBox = null; State.hoveredVideoCard = null;
       State.videoOverrides.clear();
       State.imageOverrides.clear();
       State.fallbackAttempted.clear();
       VideoState.clear();
       MediaState.clear();
       State.retryWaiters = Object.create(null);
+      resetDetectCache();
       refreshCount();
     }
+    /* Add links after the ones already there (used by the video "capture
+       frame" button). If everything so far is on screen the new item is
+       built too; otherwise it joins the end of the queue and appears with
+       the last page, exactly where it sits in the list. */
     function appendUrls(urls) {
       if (!urls || !urls.length) return;
-      var startIdx = State.allUrls.length;
+      var allBuilt = State.slots.length === State.allUrls.length;
       State.allUrls = State.allUrls.concat(urls);
-      var frag = document.createDocumentFragment();
-      for (var i = 0; i < urls.length; i++) {
-        var slot = makeSlot(startIdx + i);
-        State.slots.push(slot);
-        frag.appendChild(slot);
-      }
-      DOM.gallery.appendChild(frag);
-      if (!State.observer) rebuildObserver();
-      else State.slots.slice(startIdx).forEach(function (s) { State.observer.observe(s); });
-      refreshCount();
+      if (allBuilt) Pager.renderNext(urls.length);
+      else refreshCount();
     }
     return {
       makeSlot: makeSlot, activate: activate, rebuildObserver: rebuildObserver,
       clear: clear, appendUrls: appendUrls, rebuildSlot: rebuildSlot
     };
+  })();
+
+  /* ════════════════════════════════════════════════════════
+     PAGER  (progressive loading of a long list)
+
+     State.allUrls always holds every link, so the count, Append, Clear and
+     the numbering behave exactly as before. What is paged is the DOM: only
+     the first PAGE slots are built; the next PAGE are built when the
+     page-end sentinel comes within two screens of the viewport (same
+     observer as the slots), or on demand with "Load more" / "Load all".
+     State.slots is therefore always a prefix of State.allUrls.
+  ════════════════════════════════════════════════════════ */
+  var Pager = (function () {
+    var PAGE = 100;
+
+    function remaining() { return State.allUrls.length - State.slots.length; }
+
+    /* (Re)start watching the sentinel. An observe() always delivers one fresh
+       report, even if nothing changed — which is what lets a still-visible
+       sentinel pull in the following page. */
+    function arm() {
+      var io = State.observer;
+      if (!io) return;
+      io.unobserve(DOM.gallerySentinel);
+      if (remaining() > 0) io.observe(DOM.gallerySentinel);
+    }
+
+    /* Build up to `n` more slots after the existing ones; returns how many. */
+    function renderNext(n) {
+      var left = remaining();
+      if (left <= 0) { updateUI(); return 0; }
+      n = Math.min(n || PAGE, left);
+      var start = State.slots.length;
+      var frag = document.createDocumentFragment();
+      for (var i = 0; i < n; i++) {
+        var slot = Virtual.makeSlot(start + i);
+        State.slots.push(slot);
+        frag.appendChild(slot);
+      }
+      DOM.gallery.appendChild(frag);
+      updateUI();
+      if (!State.observer) {
+        Virtual.rebuildObserver();                  /* observes every slot, then arms the sentinel */
+      } else {
+        for (var j = start; j < State.slots.length; j++) State.observer.observe(State.slots[j]);
+        arm();
+      }
+      return n;
+    }
+
+    function renderAll() { renderNext(remaining()); }
+    function onSentinel() { if (remaining() > 0) renderNext(PAGE); }
+
+    function updateUI() {
+      var total = State.allUrls.length, shown = State.slots.length, left = total - shown;
+      DOM.gShown.textContent = left > 0 ? ' · showing ' + shown : '';
+      DOM.galleryMore.hidden = left <= 0;
+      DOM.galleryMoreText.textContent = left > 0 ? 'Showing ' + shown + ' of ' + total + ' items' : '';
+      DOM.loadMoreBtn.textContent = 'Load ' + Math.min(PAGE, Math.max(left, 0)) + ' more';
+    }
+
+    on(DOM.loadMoreBtn, 'click', function () { renderNext(PAGE); });
+    on(DOM.loadAllBtn,  'click', renderAll);
+
+    return { PAGE: PAGE, renderNext: renderNext, renderAll: renderAll, arm: arm,
+             onSentinel: onSentinel, updateUI: updateUI, remaining: remaining };
   })();
 
   /* ════════════════════════════════════════════════════════
@@ -1251,6 +1806,10 @@
       sx = e.clientX; sy = e.clientY; tx0 = tx; ty0 = ty;
       clearTimeout(resetTid);
       box.classList.add('zoom-drag'); box.classList.remove('zoomed');
+      /* Listen on the document only while a drag is actually in progress — a
+         permanent pair per card meant dozens of idle handlers on every mouse move. */
+      document.addEventListener('mousemove', onMove);
+      document.addEventListener('mouseup',   onUp);
     });
     function onMove(e) {
       if (!dragging) return;
@@ -1264,13 +1823,12 @@
     function onUp() {
       if (!dragging) return;
       dragging = false;
+      document.removeEventListener('mousemove', onMove);
+      document.removeEventListener('mouseup',   onUp);
       box.classList.remove('zoom-drag'); box.classList.add('zoomed');
       syncCursor();
       if (!inside && s > Z_MIN + 0.02) resetTid = setTimeout(reset, 700);
     }
-    document.addEventListener('mousemove', onMove);
-    document.addEventListener('mouseup',   onUp);
-
     on(box, 'dblclick', function (e) {
       if (!zoomOn() || dragMoved || isEditing()) return;
       var r  = box.getBoundingClientRect();
@@ -1283,13 +1841,18 @@
         apply(true); syncBadge(); syncCursor();
       }
     });
-    on(DOM.zoomEnabled, 'change', function () {
+    /* Registered on the page-wide Zoom switch, so destroy() MUST remove it again:
+       every activation of a card adds one, and cards are built and torn down
+       constantly while scrolling (it used to leak one listener per activation). */
+    function onZoomToggle() {
       if (!zoomOn() && s > 1.02) reset(); else syncCursor();
-    });
+    }
+    on(DOM.zoomEnabled, 'change', onZoomToggle);
 
     function destroy() {
       document.removeEventListener('mousemove', onMove);
       document.removeEventListener('mouseup',   onUp);
+      DOM.zoomEnabled.removeEventListener('change', onZoomToggle);
       clearTimeout(resetTid);
       dragging = false;
     }
@@ -1313,24 +1876,20 @@
       var stored = EditState.get(url);
 
       /* Image box */
-      var box = el('div', 'card-img-box');
+      var box = el('div', 'card-img-box is-loading');
       var spin = makeLoadingSpinner(function () { retryImage(true); });
       box.appendChild(spin);
 
       var rotateWrap = el('div', 'img-rotate-wrap');
       var img = el('img', 'card-img');
-      img.alt = 'Image ' + (ci + 1);
+      img.alt = Util.mediaLabel(url, 'Image');     /* file name or host — the link is all we know about the picture */
       img.decoding = 'async';
       img.draggable = false;
-      img.style.transformOrigin = '0 0';
-      img.style.maxHeight = State.currentMaxH;
+      img.style.transformOrigin = '0 0';           /* max-height comes from --card-max-h (see applySize) */
 
       /* Restore persisted edit state */
       if (stored.brightness !== 1 || stored.contrast !== 1) {
         img.style.filter = 'brightness(' + stored.brightness + ') contrast(' + stored.contrast + ')';
-      }
-      if (stored.rotation !== 0) {
-        rotateWrap.style.transform = 'rotate(' + stored.rotation + 'deg)';
       }
 
       var activeSpin = spin;
@@ -1342,6 +1901,7 @@
       function syncCardStatus(status, reason) {
         MediaState.set(url, status, 'image', reason);
         card.dataset.mediaStatus = status;
+        box.classList.toggle('is-loading', status === MEDIA_STATUS.LOADING);
       }
 
       function resolveRetry(ok) {
@@ -1383,7 +1943,7 @@
         if (errDiv && errDiv.parentNode) return;
         errDiv = Chrome.buildErrorView(box, 'Could not load', url, function () {
           retryImage(false);
-        });
+        }, h.numEl.id);
       }
 
       function retryImage(fromLoading, applyLimit) {
@@ -1424,6 +1984,7 @@
       });
       rotateWrap.appendChild(img);
       box.appendChild(rotateWrap);
+      if (stored.rotation !== 0) RotateFit.set(rotateWrap, stored.rotation);   /* restore the saved rotation */
 
       /* Zoom overlay (badge + hint) */
       var overlay = Chrome.zoomOverlay(box);
@@ -1438,6 +1999,7 @@
         img.src = '';
         resolveRetry(false);
         zoom.destroy();
+        RotateFit.release(rotateWrap);
       };
       zoom.syncCursor();
 
@@ -1455,6 +2017,7 @@
       var notes; /* assigned just below; onNote only fires later, on click */
       card.appendChild(Chrome.toolbar({
         url: url,
+        describedBy: h.numEl.id,
         onEdit: function () {
           if (card.classList.contains('editing')) {
             EditMode.exit(false);
@@ -1467,7 +2030,7 @@
         onRemove: function () { Chrome.removeCard(card, ci, box._destroy); }
       }));
       var noteBtn = card.querySelector('.tnote');
-      notes = Chrome.notesSection(url, noteBtn);
+      notes = Chrome.notesSection(url, noteBtn, h.numEl.id);
       card.appendChild(notes.wrap);
       return card;
     }
@@ -1476,482 +2039,95 @@
   })();
 
   /* ════════════════════════════════════════════════════════
-     VIDEO CARD
+     VIDEO CARD  (stand-in — the player's code lives in chunks/video-card.js)
 
-     Layout:
-       .card.card-video-card
-         .card-header
-         .card-img-box.card-video-box           ← media surface
-           .img-rotate-wrap > video.card-video
-           .video-play-overlay                  ← big play button when paused
-           .video-progress-line                 ← thin gold strip, always visible
-           .video-controls                      ← overlay bar, fades in on hover
-             [⏮ ▶ ⏭]  scrubber  time  [speed]  [🔊 vol]  [📷]  [⛶]
-         .card-url-row
-         .card-toolbar (Copy/Edit/Remove)
+     build(i) must return a card synchronously (Virtual.activate and the
+     image<->video fallback both append it straight away). Until the chunk
+     has arrived that is a header + loading skeleton; when it lands the
+     placeholder is swapped for the real card — but only if its slot still
+     shows it (the slot may have scrolled away, been rebuilt or removed).
   ════════════════════════════════════════════════════════ */
   var VideoCard = (function () {
-    var PLAYBACK_RATES = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 4];
-    var FRAME_STEP = 1 / 30;
+    var api = null;
+    var stalled = [];     /* { ph, swapCtx } for every card whose player code could not be fetched */
 
-    /* See ImageCard.build's matching doc comment — same swapCtx contract,
-       mirrored for the image-failed-so-try-video direction. */
-    var VIDEO_ERROR_CODES = { 1: 'ABORTED', 2: 'NETWORK', 3: 'DECODE', 4: 'SRC_NOT_SUPPORTED' };
-    function videoErrorReason(video) {
-      var e = video.error;
-      if (!e) return 'video error: unknown';
-      var name = VIDEO_ERROR_CODES[e.code] || ('code ' + e.code);
-      return 'video error: ' + name + (e.message ? ' - ' + e.message : '');
-    }
-
-    function build(ci, swapCtx) {
+    function placeholder(ci) {
       var url = State.allUrls[ci];
-      var stored = VideoState.get(url);
-      var startsFailed = MediaState.get(url).status === MEDIA_STATUS.FAILED;
-
-      var card = el('div', 'card card-video-card');
+      var card = el('div', 'card card-video-card card-pending');
       var h = Chrome.header(ci + 1, 'video');
-
-      /* Media surface */
-      var box = el('div', 'card-img-box card-video-box');
-      var spin = makeLoadingSpinner(function () { retryVideo(true); });
-      box.appendChild(spin);
-
-      var rotateWrap = el('div', 'img-rotate-wrap');
-      var video = makeVideo(url, stored, !startsFailed);
-      rotateWrap.appendChild(video);
-      box.appendChild(rotateWrap);
-
-      /* Restore edit state for video */
-      var storedEdit = EditState.get(url);
-      if (storedEdit.brightness !== 1 || storedEdit.contrast !== 1) {
-        video.style.filter = 'brightness(' + storedEdit.brightness + ') contrast(' + storedEdit.contrast + ')';
-      }
-      if (storedEdit.rotation !== 0) {
-        rotateWrap.style.transform = 'rotate(' + storedEdit.rotation + 'deg)';
-      }
-
-      /* Zoom badge + hint — same overlay elements as ImageCard */
-      var badge = Chrome.zoomOverlay(box).badge;
-
-      /* Attach scroll-wheel zoom identical to image zoom */
-      video.style.transformOrigin = '0 0';
-      var zoom = attachZoom(card, box, video, badge);
-      zoom.syncCursor();
-
-      /* Always-visible thin progress strip pinned to the bottom edge */
-      var progressLine = el('div', 'video-progress-line');
-      var progressFill = el('div', 'video-progress-fill');
-      progressLine.appendChild(progressFill);
-      box.appendChild(progressLine);
-
-      /* Floating overlay controls bar */
-      var controlsApi = buildControls(video, box, url);
-      box.appendChild(controlsApi.bar);
-
-      /* Hover preview disabled — videos remain paused until the user clicks.
-         Controls bar reveals only while the cursor is moving over the video,
-         and hides immediately when motion stops. */
-      attachCursorReveal(box);
-
-      /* Click toggles play/pause (ignore clicks on controls) */
-      on(box, 'click', function (e) {
-        if (e.target.closest('.video-controls') ||
-            e.target.closest('.video-progress-line')) return;
-        if (video._errored) return;
-        if (video.paused) video.play().catch(function () {});
-        else              video.pause();
-      });
-
-      /* Lifecycle: load/error/state-sync */
-      var errored = false;
-      var suppressErrors = false;
-      var retryInFlight = false;
-
-      function syncCardStatus(status, reason) {
-        MediaState.set(url, status, 'video', reason);
-        card.dataset.mediaStatus = status;
-      }
-
-      function retryVideo(fromLoading, applyLimit) {
-        if (retryInFlight) return Promise.resolve(false);
-        if (!beginCardRetry(url, 'video', card, fromLoading, applyLimit)) return Promise.resolve(false);
-        retryInFlight = true;
-        suppressErrors = true;
-        Util.unloadVideo(video);
-        syncCardStatus(MEDIA_STATUS.LOADING);
-        box.innerHTML = '';
-        spin = makeLoadingSpinner(function () { retryVideo(true); });
-        box.appendChild(spin);
-
-        var wait = waitForMediaRetry(url);
-        setTimeout(function () {
-          var parentSlot = card.closest('.vslot');
-          if (parentSlot) {
-            if (box._destroy) box._destroy();
-            var idx = parseInt(parentSlot.dataset.idx, 10);
-            /* Rebuild honoring the currently-known type (getMediaType)
-               instead of always forcing VideoCard. Previously this
-               cleared both override sets and rebuilt as VideoCard
-               unconditionally, which threw away a confirmed type on
-               every retry click and let a stubbornly-broken video
-               bounce back and forth between "Video" and "Image" on
-               repeated retries instead of just retrying as a video. */
-            var freshUrl = State.allUrls[idx];
-            Virtual.rebuildSlot(parentSlot, idx, function (i) {
-              return getMediaType(freshUrl) === 'video' ? VideoCard.build(i) : ImageCard.build(i);
-            });
-          } else {
-            retryInFlight = false;
-            resolveMediaRetry(url, false);
-          }
-        }, MediaState.retryDelay(url, applyLimit));
-        return wait;
-      }
-
-      function showFailedView(resolvePending, reason) {
-        errored = true; video._errored = true;
-        if (spin.parentNode) spin.remove();
-        syncCardStatus(MEDIA_STATUS.FAILED, reason);
-        if (resolvePending) resolveMediaRetry(url, false);
-        retryInFlight = false;
-        Util.unloadVideo(video);
-        box.innerHTML = '';
-        Chrome.buildErrorView(box, 'Could not load video', url, function () {
-          retryVideo(false);
-        });
-      }
-
-      if (!startsFailed) syncCardStatus(MEDIA_STATUS.LOADING);
-      on(video, 'loadedmetadata', function () {
-        if (spin.parentNode) spin.remove();
-        syncCardStatus(MEDIA_STATUS.LOADED);
-        /* This card is the fallback attempt after an image failed, and it
-           actually decoded as a video — now it's safe to remember. */
-        if (swapCtx && swapCtx.confirmOverride) swapCtx.confirmOverride.add(url);
-        resolveMediaRetry(url, true);
-        if (video.videoWidth) {
-          h.dimsEl.textContent = video.videoWidth + ' \u00d7 ' + video.videoHeight +
-                                 ' \u2022 ' + Util.fmtTime(video.duration);
-        }
-        if (stored.time > 0 && stored.time < video.duration) {
-          try { video.currentTime = stored.time; } catch (_) {}
-        }
-        video.playbackRate = stored.rate || 1;
-        controlsApi.onMetadata();
-      });
-      on(video, 'error', function () {
-        if (suppressErrors) return;
-        if (errored) return;
-        /* Fast automatic fallback: try the other media type once before
-           giving up — see trySwapMediaType for the full rationale. */
-        if (trySwapMediaType(url, card, box, zoom, State.imageOverrides, ImageCard.build)) return;
-        var reason = swapCtx
-          ? (videoErrorReason(video) + '; ' + swapCtx.firstType + ' fallback also failed')
-          : videoErrorReason(video);
-        showFailedView(true, reason);
-      });
-
-      function persist() {
-        VideoState.set(url, {
-          time  : video.currentTime,
-          muted : video.muted,
-          volume: video.volume,
-          rate  : video.playbackRate
-        });
-      }
-      on(video, 'play',  function () { box.classList.add('playing');    persist(); });
-      on(video, 'pause', function () { box.classList.remove('playing'); persist(); });
-      on(video, 'ended', function () { box.classList.remove('playing'); });
-      on(video, 'timeupdate', function () {
-        controlsApi.onTimeUpdate();
-        if (video.duration > 0) {
-          var pct = (video.currentTime / video.duration) * 100;
-          progressFill.style.width = pct.toFixed(2) + '%';
-        }
-      });
-      on(video, 'ratechange', function () { controlsApi.onRateChange(); persist(); });
-      on(video, 'volumechange', function () { controlsApi.onVolumeChange(); persist(); });
-
-      /* Frame-step helpers exposed for keyboard shortcuts */
-      function frameStep(dir) {
-        if (errored) return;
-        video.pause();
-        video.currentTime = Util.clamp(
-          video.currentTime + dir * FRAME_STEP, 0, video.duration || 0
-        );
-      }
-
-      /* Memory release hook */
-      box._retryMedia = retryVideo;
-      card._retryMedia = retryVideo;
-      box._destroy = function () {
-        suppressErrors = true;
-        try { video.pause(); } catch (_) {}
-        persist();
-        zoom.destroy();
-        controlsApi.destroy();
-        video.removeAttribute('src');
-        try { video.load(); } catch (_) {}
-      };
-
-      /* Compose */
+      var box = el('div', 'card-img-box card-video-box is-loading');
+      box.appendChild(makeLoadingSpinner());
       card.appendChild(h.hdr);
       card.appendChild(box);
       card.appendChild(Chrome.urlRow(url));
-      var notes; /* assigned just below; onNote only fires later, on click */
-      card.appendChild(Chrome.toolbar({
-        url: url,
-        onCopyLink: function () {
-          /* Always copy the EXACT original URL the user provided — no
-             timestamp fragment, no thumbnail-seed (#t=0.1) we added
-             internally. This is the link the user expects to paste. */
-          return { text: url, label: 'Copied!' };
-        },
-        onEdit: function () {
-          if (card.classList.contains('editing')) { EditMode.exit(false); }
-          else { video.pause(); zoom.reset(false); EditMode.enter(card, url); }
-        },
-        onNote: function () { notes.wrap.classList.toggle('hide'); },
-        onRemove: function () { Chrome.removeCard(card, ci, box._destroy); }
-      }));
-      var noteBtn = card.querySelector('.tnote');
-      notes = Chrome.notesSection(url, noteBtn);
-      card.appendChild(notes.wrap);
-
-      /* Expose for keyboard handler */
-      card._video     = video;
-      card._frameStep = frameStep;
-      if (startsFailed) showFailedView(false);
-      return card;
+      return { card: card, box: box, url: url, describedBy: h.numEl.id };
     }
 
-    /* ── Build the underlying <video> element with sane defaults ──
-       preload="metadata" → the browser fetches only metadata on load,
-       saving bandwidth and avoiding connection blocking. Combined with
-       virtualization (only ~2 screens of cards are mounted at any
-       time), this is safe for 500+ video sets while still feeling
-       instant. Videos always start PAUSED and MUTED. */
-    function makeVideo(url, stored, shouldLoad) {
-      var v = document.createElement('video');
-      v.className = 'card-video';
-      v.preload   = 'metadata';
-      v.playsInline = true;
-      /* Mute-by-default. Global "Mute All" overrides any per-video state
-         on load; the user can still un-mute an individual video after. */
-      v.muted   = GlobalVid.muteAll ? true : (stored.muted !== false);
-      v.volume  = stored.volume;
-      v.controls = false;
-      v.style.maxHeight = State.currentMaxH;
-      if (shouldLoad !== false) v.src = url;
-
-      /* Cap concurrent playbacks: when this video starts, pause every
-         other one in the gallery.  Keeps decoder + network usage flat
-         even when thousands of cards are mounted. */
-      v.addEventListener('play', function () {
-        var all = document.querySelectorAll('video.card-video');
-        for (var i = 0; i < all.length; i++) {
-          if (all[i] !== v && !all[i].paused) {
-            try { all[i].pause(); } catch (_) {}
-          }
-        }
-      });
-      /* Apply global playback rate as soon as metadata is ready. */
-      v.addEventListener('loadedmetadata', function () {
-        try { v.playbackRate = GlobalVid.rate; } catch (_) {}
-      });
-      return v;
+    /* Put the real card where the placeholder is — if its slot still shows it.
+       The slot may have scrolled out of range, been rebuilt or been removed while
+       the code was on its way. Removing a card ABOVE it renumbers the slots, so
+       the index is read now, not remembered from build time. */
+    function swapIn(ph, swapCtx, a) {
+      var slot = ph.card.closest('.vslot');
+      if (!slot || !State.activeSet.has(slot)) return;
+      var idx = parseInt(slot.dataset.idx, 10);
+      if (State.allUrls[idx] !== ph.url) return;
+      Virtual.rebuildSlot(slot, idx, function (i) { return a.build(i, swapCtx); });
     }
 
-    /* ── Cursor-reveal: show controls while pointer is moving, and KEEP
-         them visible whenever the pointer is hovering the control bar
-         itself (so users can comfortably click play / scrub / etc.). ── */
-    function attachCursorReveal(box) {
-      var IDLE_MS = 90;          /* hides almost immediately when cursor stops */
-      var idleTimer = 0;
-      var overBar  = false;      /* pointer is currently inside .video-controls */
-
-      function show() {
-        box.classList.add('cursor-active');
-        if (idleTimer) { clearTimeout(idleTimer); idleTimer = 0; }
-        /* Don't start the hide-timer while the cursor is parked on
-           the control bar — the bar must stay fully visible. */
-        if (!overBar) idleTimer = setTimeout(hide, IDLE_MS);
-      }
-      function hide() {
-        idleTimer = 0;
-        if (overBar) return;     /* safety: never hide while on the bar */
-        box.classList.remove('cursor-active');
-      }
-
-      on(box, 'mousemove',  show);
-      on(box, 'mouseenter', show);
-      on(box, 'mouseleave', function () {
-        overBar = false;
-        if (idleTimer) { clearTimeout(idleTimer); idleTimer = 0; }
-        hide();
-      });
-      on(box, 'mousedown',   show);
-      on(box, 'pointerdown', show);
-      on(box, 'focusin',     show);
-      on(box, 'touchstart',  show);
-
-      /* Track the pointer relative to the control bar.  We attach
-         listeners after a microtask so the bar element exists. */
-      Promise.resolve().then(function () {
-        var bar = box.querySelector('.video-controls');
-        if (!bar) return;
-        on(bar, 'mouseenter', function () {
-          overBar = true;
-          if (idleTimer) { clearTimeout(idleTimer); idleTimer = 0; }
-          box.classList.add('cursor-active');
-        });
-        on(bar, 'mouseleave', function () {
-          overBar = false;
-          show();                /* restart idle timer */
-        });
-      });
+    function showLoading(ph) {
+      ph.box.textContent = '';
+      ph.box.classList.add('is-loading');
+      ph.box.appendChild(makeLoadingSpinner());
     }
 
-    /* ── Controls bar (floating overlay) ──
-       Returns { bar, onMetadata, onTimeUpdate, onRateChange, onVolumeChange, destroy } */
-    function buildControls(video, box, url) {
-      var bar = el('div', 'video-controls');
-
-      /* Left cluster: frame step / play / frame step */
-      var prevBtn = Chrome.makeBtn('vc-btn', '\u23EE', 'Previous frame (,)');
-      var playBtn = Chrome.makeBtn('vc-btn vc-play', '\u25B6', 'Play / Pause (Space)');
-      var nextBtn = Chrome.makeBtn('vc-btn', '\u23ED', 'Next frame (.)');
-
-      on(prevBtn, 'click', function (e) { e.stopPropagation();
-        video.pause();
-        video.currentTime = Util.clamp(video.currentTime - FRAME_STEP, 0, video.duration || 0);
-      });
-      on(nextBtn, 'click', function (e) { e.stopPropagation();
-        video.pause();
-        video.currentTime = Util.clamp(video.currentTime + FRAME_STEP, 0, video.duration || 0);
-      });
-      on(playBtn, 'click', function (e) { e.stopPropagation();
-        if (video.paused) video.play().catch(function () {});
-        else              video.pause();
-      });
-      on(video, 'play',  function () { playBtn.textContent = '\u2759\u2759'; });
-      on(video, 'pause', function () { playBtn.textContent = '\u25B6'; });
-
-      /* Scrubber */
-      var seek = document.createElement('input');
-      seek.type = 'range'; seek.className = 'vc-seek';
-      seek.min = '0'; seek.max = '0'; seek.step = 'any'; seek.value = '0';
-      var scrubbing = false;
-      on(seek, 'input',  function ()  {
-        scrubbing = true;
-        timeEl.textContent = Util.fmtTime(parseFloat(seek.value)) +
-                             ' / ' + Util.fmtTime(video.duration || 0);
-      });
-      on(seek, 'change', function ()  {
-        video.currentTime = parseFloat(seek.value);
-        scrubbing = false;
-      });
-      on(seek, 'click',  Util.stop);
-
-      var timeEl = el('span', 'vc-time'); timeEl.textContent = '0:00 / 0:00';
-
-      /* Speed slider — drag to change playback rate. Double-click the
-         badge to snap back to 1×. Mirrors the global Speed All slider. */
-      var speedWrap = el('span', 'vc-speedwrap');
-      var speedBar  = document.createElement('input');
-      speedBar.type = 'range'; speedBar.className = 'vc-speedbar';
-      speedBar.min = '0.25'; speedBar.max = '4'; speedBar.step = '0.05';
-      speedBar.value = String(video.playbackRate || 1);
-      speedBar.title = 'Playback speed';
-      var speedBtn = Chrome.makeBtn('vc-btn vc-speed', '1\u00D7', 'Double-click to reset speed');
-      on(speedBar, 'input', function (e) {
-        e.stopPropagation();
-        video.playbackRate = parseFloat(speedBar.value);
-      });
-      on(speedBar, 'click', Util.stop);
-      on(speedBtn, 'dblclick', function (e) {
-        e.stopPropagation();
-        video.playbackRate = 1;
-        speedBar.value = '1';
-      });
-      speedWrap.appendChild(speedBar);
-      speedWrap.appendChild(speedBtn);
-
-      /* Mute / volume */
-      var muteBtn = Chrome.makeBtn('vc-btn', '\uD83D\uDD0A', 'Mute (M)');
-      var volBar  = document.createElement('input');
-      volBar.type = 'range'; volBar.className = 'vc-vol';
-      volBar.min = '0'; volBar.max = '1'; volBar.step = '0.01';
-      volBar.value = String(video.volume);
-      on(muteBtn, 'click', function (e) {
-        e.stopPropagation();
-        video.muted = !video.muted;
-      });
-      on(volBar, 'input', function (e) {
-        e.stopPropagation();
-        video.volume = parseFloat(volBar.value);
-        video.muted = video.volume === 0;
-      });
-      on(volBar, 'click', Util.stop);
-
-      /* Snapshot — capture current frame as a new image entry */
-      var snapBtn = Chrome.makeBtn('vc-btn vc-snap', '\uD83D\uDCF7', 'Capture frame as image');
-      on(snapBtn, 'click', function (e) {
-        e.stopPropagation();
-        try {
-          var canvas = document.createElement('canvas');
-          canvas.width  = video.videoWidth  || 1280;
-          canvas.height = video.videoHeight || 720;
-          canvas.getContext('2d').drawImage(video, 0, 0, canvas.width, canvas.height);
-          var dataUrl = canvas.toDataURL('image/png');
-          Virtual.appendUrls([dataUrl]);
-          snapBtn.classList.add('ok');
-          setTimeout(function () { snapBtn.classList.remove('ok'); }, 1200);
-        } catch (err) {
-          Toast.show('Snapshot blocked (cross-origin video).', 'err', 3500);
-        }
-      });
-
-      /* Fullscreen */
-      var fsBtn = Chrome.makeBtn('vc-btn', '\u26F6', 'Fullscreen');
-      on(fsBtn, 'click', function (e) {
-        e.stopPropagation();
-        if (box.requestFullscreen) box.requestFullscreen();
-        else if (video.webkitEnterFullscreen) video.webkitEnterFullscreen();
-      });
-
-      [prevBtn, playBtn, nextBtn, seek, timeEl, speedWrap, muteBtn, volBar, snapBtn, fsBtn]
-        .forEach(function (n) { bar.appendChild(n); });
-
-      function onMetadata() {
-        seek.max = String(video.duration || 0);
-        onTimeUpdate();
-      }
-      function onTimeUpdate() {
-        if (!scrubbing) seek.value = String(video.currentTime || 0);
-        timeEl.textContent = Util.fmtTime(video.currentTime || 0) +
-                             ' / ' + Util.fmtTime(video.duration || 0);
-      }
-      function onRateChange() {
-        var r = video.playbackRate;
-        speedBtn.textContent = (Number.isInteger(r) ? r : r.toFixed(2).replace(/0+$/, '').replace(/\.$/, '')) + '\u00D7';
-        speedBtn.classList.toggle('alt', r !== 1);
-        if (parseFloat(speedBar.value) !== r) speedBar.value = String(r);
-      }
-      function onVolumeChange() {
-        muteBtn.textContent = (video.muted || video.volume === 0)
-          ? '\uD83D\uDD07' : '\uD83D\uDD0A';
-        volBar.value = String(video.muted ? 0 : video.volume);
-      }
-      function destroy() { /* event listeners live on controls subtree; GC handles them */ }
-
-      onRateChange(); onVolumeChange();
-      return { bar: bar, onMetadata: onMetadata, onTimeUpdate: onTimeUpdate,
-               onRateChange: onRateChange, onVolumeChange: onVolumeChange, destroy: destroy };
+    function attach(ph, swapCtx) {
+      Chunks.load('video-card').then(function (a) {
+        api = a;
+        swapIn(ph, swapCtx, a);
+        /* The code is here now, so cards that gave up waiting for it earlier get
+           their player too — one Retry click is enough, not one per card. */
+        var waiting = stalled;
+        stalled = [];
+        waiting.forEach(function (w) { swapIn(w.ph, w.swapCtx, a); });
+      }, function () { giveUp(ph, swapCtx); });
     }
 
-    return { build: build };
+    /* Could not fetch the player code. The link itself may be fine, so this is NOT
+       recorded as a failed media load — just offer to try again. */
+    function giveUp(ph, swapCtx) {
+      if (!ph.card.isConnected) return;                 /* the card left the page meanwhile */
+      var entry = { ph: ph, swapCtx: swapCtx };
+      stalled = stalled.filter(function (e) { return e.ph.card.isConnected; });
+      stalled.push(entry);
+      ph.box.textContent = '';
+      ph.box.classList.remove('is-loading');
+      Chrome.buildErrorView(ph.box, 'Could not load the video player', ph.url, function () {
+        var k = stalled.indexOf(entry);
+        if (k >= 0) stalled.splice(k, 1);
+        showLoading(ph);
+        attach(ph, swapCtx);
+      }, ph.describedBy);
+    }
+
+    /* The top-bar Retry also covers these cards (they are not "failed media", so
+       the retry tool would not see them). Returns how many were set going again. */
+    function retryStalled() {
+      var again = stalled.filter(function (e) { return e.ph.card.isConnected; });
+      stalled = [];
+      again.forEach(function (e) { showLoading(e.ph); attach(e.ph, e.swapCtx); });
+      return again.length;
+    }
+
+    function build(ci, swapCtx) {
+      api = api || Chunks.peek('video-card');
+      if (api) return api.build(ci, swapCtx);
+      var ph = placeholder(ci);
+      attach(ph, swapCtx);
+      return ph.card;
+    }
+
+    return { build: build, retryStalled: retryStalled };
   })();
 
   /* ════════════════════════════════════════════════════════
@@ -1962,119 +2138,33 @@
     State.hoveredBox        = (t.closest && t.closest('.card-img-box')) || null;
     State.hoveredVideoCard  = (t.closest && t.closest('.card-video-card')) || null;
   }, { passive: true });
+  /* Keyboard users never "hover": the video card they are working in (focus is
+     on one of its controls) is the target of the video shortcuts instead. */
+  on(document, 'focusin', function (e) {
+    var t = e.target;
+    var c = t && t.closest && t.closest('.card-video-card');
+    if (c) State.hoveredVideoCard = c;
+  });
 
   /* ════════════════════════════════════════════════════════
-     FAILED MEDIA RETRY (whole gallery)
+     FAILED MEDIA RETRY  (whole gallery — code in chunks/retry-failed.js)
   ════════════════════════════════════════════════════════ */
   (function RetryFailedMedia() {
-    var running = false;
-
-    /* Collect every FAILED url across the whole gallery — not just a
-       small window near the current scroll position. Slots that are
-       currently mounted (State.activeSet) are retried for real, right
-       now, with bounded concurrency exactly like before. Off-screen
-       slots are deliberately NOT force-mounted: building live
-       <img>/<video> elements (and opening real S3 connections) for up
-       to 1,000 items at once would blow past the ~30-80 live-node
-       budget the virtual scroller is built around. Instead their
-       failed state is cleared so the moment they scroll into view they
-       attempt a fresh load instead of immediately showing "failed"
-       again — so every failed item genuinely gets retried, either
-       immediately (if mounted) or on next scroll-into-view (if not),
-       and performance stays exactly as before. */
-    function collect() {
-      var activeTasks = [];
-      var queuedCount = 0;
-      for (var idx = 0; idx < State.slots.length; idx++) {
-        var slot = State.slots[idx];
-        var url = State.allUrls[idx];
-        if (!slot || !url) continue;
-
-        var mediaState = MediaState.get(url);
-        if (mediaState.status !== MEDIA_STATUS.FAILED) continue;
-
-        if (State.activeSet.has(slot)) {
-          var card = slot.querySelector('.card');
-          if (card && typeof card._retryMedia === 'function') {
-            mediaState.retryCount = 0;
-            activeTasks.push({ url: url, card: card });
-            continue;
-          }
-        }
-        /* Off-screen (or missing its card for some reason) — reset so
-           the next activation attempts a fresh load instead of
-           re-showing the stale failed view. */
-        mediaState.status = null;
-        mediaState.retryCount = 0;
-        queuedCount++;
-      }
-      return { activeTasks: activeTasks, queuedCount: queuedCount };
-    }
-
-    function runQueue(tasks, onDone) {
-      var next = 0, done = 0, ok = 0;
-
-      function launch() {
-        if (next >= tasks.length) {
-          if (done >= tasks.length) onDone(done, ok);
-          return;
-        }
-        var task = tasks[next++];
-        /* applyLimit=false — an explicit "Retry" click is a deliberate,
-           whole-gallery user action, so every failed item gets a fresh
-           attempt regardless of any earlier automatic-retry cap. */
-        Promise.resolve(task.card._retryMedia(false, false))
-          .then(function (success) { if (success) ok++; })
-          .catch(function () {})
-          .then(function () {
-            done++;
-            if (done >= tasks.length) onDone(done, ok);
-            else setTimeout(launch, RETRY_CONFIG.delayMs);
-          });
-      }
-
-      if (!tasks.length) { onDone(0, 0); return; }
-      for (var i = 0; i < RETRY_CONFIG.concurrency && i < tasks.length; i++) {
-        setTimeout(launch, i * RETRY_CONFIG.delayMs);
-      }
-    }
-
+    var api = null;
+    function prefetch() { Chunks.prefetch('retry-failed'); }
+    on(DOM.retryVisibleFailedBtn, 'pointerenter', prefetch);
+    on(DOM.retryVisibleFailedBtn, 'focus', prefetch);
     on(DOM.retryVisibleFailedBtn, 'click', function () {
-      if (running) return;
-      var collected = collect();
-      var activeTasks = collected.activeTasks;
-      var queuedCount = collected.queuedCount;
-
-      if (!activeTasks.length && !queuedCount) {
-        Toast.show('No failed media to retry.', 'ok', 2200);
-        return;
-      }
-
-      running = true;
-      DOM.retryVisibleFailedBtn.disabled = true;
-      DOM.retryVisibleFailedBtn.textContent = 'Retrying...';
-
-      var startParts = [];
-      if (activeTasks.length) startParts.push('retrying ' + activeTasks.length + ' now');
-      if (queuedCount) startParts.push(queuedCount + ' more queued to reload on scroll');
-      Toast.show('Failed media \u2014 ' + startParts.join(', ') + '.', 'ok', 2800);
-
-      runQueue(activeTasks, function (done, ok) {
-        running = false;
-        DOM.retryVisibleFailedBtn.disabled = false;
-        DOM.retryVisibleFailedBtn.innerHTML = '&#8634; Retry';
-        var parts = [];
-        if (done) parts.push(done + ' retried' + (ok ? ' (' + ok + ' recovered)' : ''));
-        if (queuedCount) parts.push(queuedCount + ' queued for scroll-in');
-        var msg = parts.length ? parts.join('; ') + '.' : 'Nothing left to retry.';
-        Toast.show(msg, (ok || queuedCount) ? 'ok' : 'err', 3200);
-      });
+      var again = VideoCard.retryStalled();       /* cards still waiting for the video player's code */
+      if (api) { api.run(again); return; }
+      Chunks.load('retry-failed').then(function (a) { api = a; a.run(again); },
+                                       function () { Chunks.failed('the retry tool'); });
     });
   })();
 
   /* ════════════════════════════════════════════════════════
      KEYBOARD
-  ═══════════════════════════════════════��════════════════ */
+  ════════════════════════════════════════════════════════ */
   (function Keyboard() {
     var scrollVel = 0, scrollDir = 0, scrollRaf = null;
     var held = Object.create(null);
@@ -2121,13 +2211,21 @@
     }
 
     on(document, 'keydown', function (e) {
+      if (!e.key) return;                 /* e.g. browser autofill fires key-less keydown events */
+
+      /* A modal dialog (Common Notes) owns the keyboard: only Esc is ours. */
+      if (CommonNotes.isOpen()) {
+        if (e.key === 'Escape') CommonNotes.hide();
+        return;
+      }
+
       /* Space: play/pause hovered video, otherwise block native scroll.
-         Bail out first when a text field (URL box, card notes, …) is
-         focused so Space types a literal space instead of being eaten —
-         previously this fired e.preventDefault() unconditionally, which
-         made it impossible to type multi-word notes. */
+         Leave it alone when a text field (URL box, card notes, …) is focused,
+         so Space types a literal space, and when keyboard focus is on a button,
+         select or switch, so Space still activates it (it used to be swallowed
+         there — keyboard users could not press any button with Space). */
       if (e.code === 'Space') {
-        if (Util.isTyping()) return;
+        if (Util.isTyping() || Util.isInteractive()) return;
         e.preventDefault();
         if (State.hoveredVideoCard && State.hoveredVideoCard._video) {
           var v = State.hoveredVideoCard._video;
@@ -2141,7 +2239,7 @@
       if (!Util.isTyping() && handleVideoShortcut(e)) return;
 
       if (e.key === 'Escape') {
-        if (CommonNotes.isOpen()) { CommonNotes.hide(); return; }
+        if (Help.isOpen()) { Help.close(); return; }
         if (EditMode.isActive()) EditMode.exit(false);
         return;
       }
@@ -2200,15 +2298,30 @@
   /* ════════════════════════════════════════════════════════
      BULK LOAD
   ════════════════════════════════════════════════════════ */
-  /* Shared tail of both bulk-load branches below: fade out the progress
-     bar, clear the input, and release the loading lock. */
+  /* Resolves after the browser has painted, so a status message actually shows. */
+  function nextFrame() {
+    return new Promise(function (r) { requestAnimationFrame(function () { requestAnimationFrame(function () { r(); }); }); });
+  }
+
+  function setProgress(pct, label) {
+    DOM.progFill.style.width = pct + '%';
+    DOM.progWrap.setAttribute('aria-valuenow', String(pct));
+    if (label != null) DOM.progLabel.textContent = label;
+  }
+
+  /* Shared tail of the bulk-load: fade out the progress bar, clear the
+     input, and release the loading lock. */
+  var progHideTid = 0;
   function finishBulkLoadUI() {
-    setTimeout(function () { DOM.progWrap.classList.add('hide'); DOM.progFill.style.width = '0%'; }, 2400);
+    progHideTid = setTimeout(function () { DOM.progWrap.classList.add('hide'); setProgress(0); }, 2400);
     DOM.bulkArea.value = '';
-    DOM.bulkTally.innerHTML = '<b>0</b> URLs';
+    updateTally.cancel();
+    setTally(0);
     State.isLoading = false;
     DOM.bulkLoadBtn.disabled = false;
   }
+
+  function plural(n, word) { return n + ' ' + word + (n !== 1 ? 's' : ''); }
 
   on(DOM.bulkLoadBtn, 'click', async function () {
     if (State.isLoading) return;
@@ -2217,52 +2330,45 @@
 
     State.isLoading = true;
     DOM.bulkLoadBtn.disabled = true;
-
-    if (!DOM.appendMode.checked) {
-      Virtual.clear();
-    }
-
-    /* ── Build slots for every URL, in chunks so the UI stays responsive ── */
-    var startIdx = State.allUrls.length;
-    State.allUrls = State.allUrls.concat(urls);
-
-    DOM.progWrap.classList.remove('hide');
-    DOM.progFill.style.width = '0%';
-    DOM.progLabel.textContent = 'Building ' + urls.length + ' slots\u2026';
-
-    if (State.observer) State.observer.disconnect();
-
-    var CHUNK = 200;
-    var frag = document.createDocumentFragment();
-    for (var i = 0; i < urls.length; i++) {
-      var slot = Virtual.makeSlot(startIdx + i);
-      State.slots.push(slot);
-      frag.appendChild(slot);
-
-      if ((i + 1) % CHUNK === 0 || i === urls.length - 1) {
-        DOM.gallery.appendChild(frag);
-        frag = document.createDocumentFragment();
-        DOM.progFill.style.width = Math.round(((i + 1) / urls.length) * 100) + '%';
-        DOM.progLabel.textContent = (i + 1) + ' / ' + urls.length + ' slots placed\u2026';
-        refreshCount();
-        await new Promise(function (r) { requestAnimationFrame(function () { requestAnimationFrame(r); }); });
+    clearTimeout(progHideTid);
+    try {
+      if (!DOM.appendMode.checked) {
+        Virtual.clear();
       }
-    }
-    Virtual.rebuildObserver();
 
-    var nVid = urls.filter(function (u) { return getMediaType(u) === 'video'; }).length;
-    var nImg = urls.length - nVid;
-    var summary = urls.length + ' item' + (urls.length !== 1 ? 's' : '') + ' loaded' +
-                  (nVid ? ' (' + nImg + ' image' + (nImg !== 1 ? 's' : '') +
-                          ', ' + nVid + ' video' + (nVid !== 1 ? 's' : '') + ')' : '') + '.';
-    DOM.progLabel.textContent = urls.length + ' items ready!';
-    Toast.show(summary, 'ok', 4000);
-    finishBulkLoadUI();
+      /* Every link is recorded up front, so the count, the numbering and Append
+         behave as they always did. Only the first page of slots is built now;
+         the rest are built as the page-end sentinel nears the viewport (Pager).
+         If part of an earlier list is still unbuilt (Append), the new links
+         simply queue behind it. */
+      var allBuilt = State.slots.length === State.allUrls.length;
+      State.allUrls = State.allUrls.concat(urls);
+
+      DOM.progWrap.classList.remove('hide');
+      setProgress(0, 'Preparing ' + plural(urls.length, 'item') + '…');
+      refreshCount();
+      await nextFrame();
+
+      if (allBuilt) Pager.renderNext(Pager.PAGE);
+      setProgress(100, State.slots.length + ' / ' + State.allUrls.length + ' slots placed…');
+
+      var nVid = 0;
+      for (var i = 0; i < urls.length; i++) { if (getMediaType(urls[i]) === 'video') nVid++; }
+      var nImg = urls.length - nVid;
+      var summary = plural(urls.length, 'item') + ' loaded' +
+                    (nVid ? ' (' + plural(nImg, 'image') + ', ' + plural(nVid, 'video') + ')' : '') + '.';
+      if (Pager.remaining() > 0) summary += ' The rest load as you scroll.';
+      DOM.progLabel.textContent = urls.length + ' items ready!';
+      Toast.show(summary, 'ok', 4000);
+    } finally {
+      finishBulkLoadUI();
+    }
   });
 
   on(DOM.bulkClearBtn, 'click', function () {
     DOM.bulkArea.value = '';
-    DOM.bulkTally.innerHTML = '<b>0</b> URLs';
+    updateTally.cancel();
+    setTally(0);
   });
 
   on(DOM.clearAllBtn, 'click', function () {
@@ -2291,10 +2397,15 @@
 
     /* MUTE ALL — toggles. When ON, every current AND future video is muted. */
     function syncMuteBtn() {
-      DOM.muteAllBtn.classList.toggle('active', GlobalVid.muteAll);
-      DOM.muteAllBtn.innerHTML = GlobalVid.muteAll
-        ? '\uD83D\uDD07 Unmute All'
-        : '\uD83D\uDD0A Mute All';
+      var btn = DOM.muteAllBtn;
+      btn.classList.toggle('active', GlobalVid.muteAll);
+      var glyph = el('span');
+      glyph.setAttribute('aria-hidden', 'true');
+      glyph.textContent = GlobalVid.muteAll ? '\uD83D\uDD07' : '\uD83D\uDD0A';
+      btn.textContent = '';
+      btn.appendChild(glyph);
+      btn.appendChild(document.createTextNode(GlobalVid.muteAll ? ' Unmute All' : ' Mute All'));
+      btn.title = GlobalVid.muteAll ? 'Unmute every video' : 'Mute every video';
     }
     on(DOM.muteAllBtn, 'click', function () {
       GlobalVid.muteAll = !GlobalVid.muteAll;
@@ -2313,14 +2424,17 @@
     function applyGlobalRate(r) {
       GlobalVid.rate = r;
       DOM.globalSpeedBadge.textContent = fmtRate(r);
+      DOM.globalSpeed.setAttribute('aria-valuetext', fmtRate(r));
       DOM.globalSpeedBadge.parentElement.classList.toggle('alt', r !== 1);
       allVideos().forEach(function (v) {
         try { v.playbackRate = r; } catch (_) {}
       });
     }
-    on(DOM.globalSpeed, 'input', function () {
+    /* At most once per frame while dragging; it reads the slider at run time so a
+       double-click reset (below) can never be overwritten by a stale value. */
+    on(DOM.globalSpeed, 'input', Util.rafThrottle(function () {
       applyGlobalRate(parseFloat(DOM.globalSpeed.value));
-    });
+    }));
     /* Double-click the badge to snap back to 1×. */
     on(DOM.globalSpeedBadge, 'dblclick', function () {
       DOM.globalSpeed.value = '1';
@@ -2332,10 +2446,75 @@
   /* ════════════════════════════════════════════════════════
      BACK TO TOP
   ════════════════════════════════════════════════════════ */
-  on(window, 'scroll', function () {
+  var syncBtt = Util.rafThrottle(function () {
     DOM.btt.classList.toggle('show', window.scrollY > 280);
-  }, { passive: true });
-  on(DOM.btt, 'click', function () { window.scrollTo({ top: 0, behavior: 'smooth' }); });
+  });
+  on(window, 'scroll', syncBtt, { passive: true });
+  on(DOM.btt, 'click', function () {
+    window.scrollTo({ top: 0, behavior: Util.prefersReducedMotion() ? 'auto' : 'smooth' });
+    /* The button hides itself at the top of the page; keep keyboard focus on the page. */
+    DOM.pageBody.focus({ preventScroll: true });
+  });
+
+  /* ════════════════════════════════════════════════════════
+     PRIVACY CONTROLS  (footer)
+     "Privacy settings" brings the storage banner back. "Delete my data"
+     erases what Bat-Viewer keeps on this device (the saved theme and the
+     banner choice) and everything it holds in memory for this page (the
+     gallery, per-card notes, edits and video positions, the Common Notes
+     text). It asks for a second click first, because the gallery and the
+     notes cannot be brought back. Nothing is stored on any server, so there
+     is nothing to delete anywhere else.
+  ════════════════════════════════════════════════════════ */
+  (function DataControls() {
+    var btn = DOM.deleteDataBtn, idleLabel = btn.textContent;
+    var armed = false, armTid = 0;
+
+    function disarm() {
+      armed = false;
+      clearTimeout(armTid);
+      btn.textContent = idleLabel;
+      btn.classList.remove('is-armed');
+    }
+
+    function deleteAll() {
+      Store.clearAll();
+      Consent.reset();
+      Virtual.clear();
+      State.noteStates = Object.create(null);
+      State.editStates = Object.create(null);
+      ProbeCache = Object.create(null);
+      CommonNotes.clear();
+      DOM.bulkArea.value = '';
+      updateTally.cancel();
+      setTally(0);
+      Theme.apply('night', false);
+      Toast.show('Done — everything Bat-Viewer kept on this device has been deleted.', 'ok', 5000);
+      if (Store.available()) ConsentBanner.show(false);       /* nothing is remembered, so it asks again */
+    }
+
+    on(btn, 'click', function () {
+      if (!armed) {
+        armed = true;
+        btn.textContent = 'Click again to confirm';
+        btn.classList.add('is-armed');
+        Toast.show('This clears your gallery, notes and edits and the settings saved in this browser. Click “Click again to confirm” within 6 seconds to go ahead.', 'err', 6000);
+        armTid = setTimeout(disarm, 6000);
+        return;
+      }
+      disarm();
+      deleteAll();
+    });
+    on(btn, 'blur', disarm);                                   /* moving on counts as changing your mind */
+
+    on(DOM.privacySettingsBtn, 'click', function () {
+      if (!Store.available()) {
+        Toast.show('Your browser is blocking local storage, so Bat-Viewer is not saving anything.', 'ok', 4500);
+        return;
+      }
+      ConsentBanner.show(true);
+    });
+  })();
 
   /* ════════════════════════════════════════════════════════
      TOPBAR HEIGHT SYNC

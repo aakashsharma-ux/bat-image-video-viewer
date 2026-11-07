@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="night">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Privacy policy — Bat-Viewer</title>
+<meta name="description" content="Bat-Viewer collects nothing: no accounts, analytics or ads. Your theme is only remembered on your own device, and only if you allow it.">
+<meta name="theme-color" content="#07070b">
+<meta name="color-scheme" content="dark light">
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<!-- Same rule as the app: scripts and styles only from this site. These pages need no images or network access beyond their own files. -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'">
+<link rel="icon" type="image/png" href="assets/logo-96.png">
+<link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="legal.css">
+<script defer src="legal.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to the content</a>
+
+<header class="legal-header">
+  <a class="legal-back" href="./"><span aria-hidden="true">&larr;</span>&nbsp;Back to Bat-Viewer</a>
+</header>
+
+<main class="legal" id="main" tabindex="-1">
+  <h1>Privacy policy</h1>
+  <p class="legal-meta">Last updated: 29 October 2026</p>
+
+  <p class="summary"><strong>Short version:</strong> Bat-Viewer has no accounts, no analytics, no ads and no tracking. It never uploads the links you paste or the pictures and videos they point to. The only thing it can remember is your Night/Moon theme, in your own browser, and only if you press &ldquo;Allow&rdquo; on the banner.</p>
+
+  <h2>1. Who runs Bat-Viewer</h2>
+  <p>Bat-Viewer is a free, non-commercial hobby project run by the GitHub user <a href="https://github.com/aakashsharma-ux" rel="noopener noreferrer">aakashsharma-ux</a> (&ldquo;the operator&rdquo;). It has no company, staff or paid features. The way to contact the operator is through that GitHub profile, for example by opening an issue in the Bat-Viewer repository listed there.</p>
+
+  <h2>2. What Bat-Viewer collects</h2>
+  <p><strong>Nothing.</strong> Specifically:</p>
+  <ul>
+    <li>There are no accounts, sign-ups or forms that ask for personal details.</li>
+    <li>There are no analytics, advertising, tracking pixels, fingerprinting or session recording.</li>
+    <li>There are no third-party scripts, fonts or SDKs. The page tells your browser to run scripts and styles only from this site (a Content-Security-Policy), so this is enforced by your browser and not only promised here.</li>
+    <li>The links you paste, the notes you type, your edits (brightness, contrast, rotation) and your video positions stay in your browser&rsquo;s memory. They are not sent to the operator, and they disappear when you reload or close the page.</li>
+  </ul>
+
+  <h2>3. What happens when you load a link</h2>
+  <p>When you paste a link and press <em>Load Media</em>, <strong>your browser</strong> (not a Bat-Viewer server) asks the host of that link for the image or video so it can be shown. That host can see your IP address, your browser details and the link itself, and it may log them or set its own cookies under its own privacy policy. Bat-Viewer does not control this and does not receive a copy.</p>
+  <ul>
+    <li>Your browser also tells that host which site the request came from. For a cross-site request this is only the address of the Bat-Viewer site, not a page path.</li>
+    <li>For a link whose file type is not obvious, Bat-Viewer may send one extra request of the lightweight &ldquo;HEAD&rdquo; kind to the same host, to ask whether it is an image or a video. It sends no cookies with it.</li>
+    <li><em>Copy Link</em> only writes to your clipboard when you press it; Bat-Viewer never reads your clipboard. <em>Capture frame</em> makes a picture inside your browser and adds it to your gallery there.</li>
+  </ul>
+  <p>Only add links you trust and have the right to view.</p>
+
+  <h2>4. What is stored on your device</h2>
+  <p>Bat-Viewer sets no cookies. It uses your browser&rsquo;s local storage for at most two small items (details are in the <a href="cookies.html">cookie policy</a>):</p>
+  <div class="table-wrap" role="region" aria-label="Items stored on your device" tabindex="0">
+    <table>
+      <thead><tr><th scope="col">Item</th><th scope="col">What it holds</th><th scope="col">When it is saved</th></tr></thead>
+      <tbody>
+        <tr><td><code>bv-theme</code></td><td>Your theme: <code>night</code> or <code>moon</code></td><td>Only after you press &ldquo;Allow&rdquo;</td></tr>
+        <tr><td><code>bv-consent</code></td><td>Your answer to the banner: <code>granted</code> or <code>denied</code>, so it does not ask again</td><td>When you answer the banner</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>These stay on your device. They are never sent anywhere. Remembering your theme is optional, so Bat-Viewer asks first; choosing &ldquo;No thanks&rdquo; leaves everything working and nothing but your answer is kept.</p>
+
+  <h2>5. Hosting</h2>
+  <p>Bat-Viewer is a static website. When it is served from GitHub Pages, GitHub delivers the files and, like any web host, may process technical data such as your IP address in its server logs. See <a href="https://docs.github.com/en/site-policy/privacy-policies/github-general-privacy-statement" rel="noopener noreferrer">GitHub&rsquo;s privacy statement</a>. The operator runs no analytics and adds no logging of visitors. If you use a copy of Bat-Viewer hosted somewhere else, that host&rsquo;s practices apply instead.</p>
+
+  <h2>6. Your choices and rights</h2>
+  <ul>
+    <li><strong>Privacy settings</strong> (link in the footer of the app) shows the banner again so you can change your answer.</li>
+    <li><strong>Delete my data</strong> (also in the footer, with a confirmation click) erases what Bat-Viewer keeps on your device: the saved theme, your banner answer, your gallery, per-card notes and edits, and the Common Notes text. You can do the same at any time by clearing this site&rsquo;s data in your browser settings.</li>
+    <li>Nothing about you is stored on a server, so there is nothing further to access, correct or delete. If you have written to the operator (for example through GitHub) and want that message dealt with, say so in the same place.</li>
+    <li>Depending on where you live you may have rights under data-protection law, such as access, erasure and objection, and the right to complain to your local data-protection authority. They apply to any personal data held about you; the operator holds none beyond correspondence you chose to send.</li>
+  </ul>
+
+  <h2>7. Children</h2>
+  <p>Bat-Viewer is not directed at children and collects no personal information from anyone, children included.</p>
+
+  <h2>8. Changes to this policy</h2>
+  <p>If what Bat-Viewer does with data ever changes, this page will be updated first and the date at the top will change. Earlier versions can be seen in the project&rsquo;s history on GitHub.</p>
+
+  <h2>9. Contact</h2>
+  <p>Questions or requests: <a href="https://github.com/aakashsharma-ux" rel="noopener noreferrer">GitHub profile of aakashsharma-ux</a> (open an issue in the Bat-Viewer repository).</p>
+
+</main>
+
+<footer class="site-footer legal-footer">
+  <p>Bat-Viewer is a free, non-commercial project run by <a href="https://github.com/aakashsharma-ux" rel="noopener noreferrer">aakashsharma-ux</a> on GitHub. It is an unofficial fan project and is not affiliated with, endorsed by or sponsored by DC or Warner Bros. Discovery.</p>
+  <nav aria-label="Legal and privacy">
+    <a href="./">Bat-Viewer</a>
+    <a href="privacy.html">Privacy policy</a>
+    <a href="terms.html">Terms of service</a>
+    <a href="cookies.html">Cookie policy</a>
+  </nav>
+</footer>
+</body>
+</html>

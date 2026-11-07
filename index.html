@@ -3,181 +3,164 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Bat-Viewer</title>
-<link rel="icon" type="image/png" href="batman-logo.png">
+<title>Bat-Viewer — bulk image &amp; video link viewer</title>
+<meta name="description" content="Bat-Viewer is a free gallery that runs in your browser: paste up to 1,000 image or video links, then browse, zoom, adjust brightness and contrast, rotate and take session notes. No account, no uploads.">
+<meta name="theme-color" content="#07070b">
+<meta name="color-scheme" content="dark light">
+<meta name="referrer" content="strict-origin-when-cross-origin">
+
+<!-- Security policy. This is what ENFORCES "no third-party scripts, fonts or SDKs":
+     scripts and styles may only come from this origin. Images, video and the
+     content-type probe may reach any http(s) host, because those are the links
+     the user pastes. serve.js adds `frame-ancestors 'none'` as a header (a meta
+     tag cannot carry that directive). -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data: blob: https: http:; media-src 'self' data: blob: https: http:; connect-src https: http:; object-src 'none'; base-uri 'none'; form-action 'none'">
+
+<link rel="icon" type="image/png" href="assets/logo-96.png">
+
+<!-- Wallpaper preload: the media queries mirror the breakpoints in style.css (body::after). -->
+<link rel="preload" as="image" type="image/avif" href="assets/bg-1280.avif" media="(max-width: 1099px)">
+<link rel="preload" as="image" type="image/avif" href="assets/bg-1920.avif" media="(min-width: 1100px)">
+
 <link rel="stylesheet" href="style.css">
+<script defer src="app.js" id="bvScript"></script>
 </head>
-<body>
+<body class="app-page">
+
+<a class="skip-link" href="#pageBody">Skip to the link box and gallery</a>
+
+<noscript><p class="noscript">Bat-Viewer needs JavaScript to load and display your media.</p></noscript>
+
+<!-- Storage-preference banner. Shown only until the visitor chooses; see app.js (Consent). -->
+<div id="consentBanner" class="consent-banner" role="region" aria-labelledby="consentTitle" hidden>
+  <p class="consent-title" id="consentTitle">Remember your theme?</p>
+  <p>Bat-Viewer can keep your Night/Moon choice in this browser's local storage so it's still there next visit. It never leaves your device. Bat-Viewer sets no cookies and has no ads or tracking. <a href="cookies.html">Details</a></p>
+  <p class="consent-status" id="consentStatus" hidden></p>
+  <div class="consent-actions">
+    <button type="button" class="btn-choice" id="consentDeny">No thanks</button>
+    <button type="button" class="btn-choice" id="consentAllow">Allow</button>
+  </div>
+</div>
 
 <!-- STICKY TOPBAR -->
-<div id="topbar">
+<header id="topbar">
   <div class="logo">
-    <div class="logo-icon"><img src="batman-logo.png" alt="Batman"></div>
-    <span class="logo-text">Bat-Viewer</span>
+    <div class="logo-icon"><img src="assets/logo-96.png" alt="" width="28" height="28"></div>
+    <h1 class="logo-text">Bat-Viewer</h1>
   </div>
 
   <div class="ctrl-group">
-    <span class="ctrl-label">Image Size <small>(+/-)</small></span>
+    <label class="ctrl-label" for="sizer">Image Size <small>(+/-)</small></label>
     <input type="range" class="ctrl-slider" id="sizer" min="1" max="10" value="3" step="1">
-    <span class="ctrl-badge" id="sizeBadge">Medium</span>
+    <span class="ctrl-badge" id="sizeBadge" aria-hidden="true">Medium</span>
   </div>
 
   <div class="ctrl-group">
-    <span class="ctrl-label">Scroll Speed <small>(W/S/Arrows)</small></span>
+    <label class="ctrl-label" for="scrollSpeed">Scroll Speed <small>(W/S/Arrows)</small></label>
     <input type="range" class="ctrl-slider" id="scrollSpeed" min="1" max="5" value="2" step="1">
-    <span class="ctrl-badge" id="scrollBadge">Slow</span>
+    <span class="ctrl-badge" id="scrollBadge" aria-hidden="true">Slow</span>
   </div>
 
   <label class="ctrl-toggle" title="Toggle zoom (Z key)">
-    <input type="checkbox" id="zoomEnabled">
-    <span class="tog-track"><span class="tog-thumb"></span></span>
+    <input type="checkbox" id="zoomEnabled" role="switch">
+    <span class="tog-track" aria-hidden="true"><span class="tog-thumb"></span></span>
     <span class="ctrl-label">Zoom <small>(Z)</small></span>
   </label>
 
-  <button class="btn-bar" id="retryVisibleFailedBtn" title="Retry every failed image and video in the gallery">&#8634; Retry</button>
+  <button type="button" class="btn-bar" id="retryVisibleFailedBtn" title="Retry every failed image and video in the gallery"><span aria-hidden="true">&#8634;</span> Retry</button>
 
   <div class="ctrl-group" id="globalSpeedGroup" title="Apply playback speed to all videos">
-    <span class="ctrl-label">Speed All</span>
+    <label class="ctrl-label" for="globalSpeed">Speed All</label>
     <input type="range" class="ctrl-slider" id="globalSpeed" min="0.25" max="4" value="1" step="0.05">
-    <span class="ctrl-badge" id="globalSpeedBadge">1.00&times;</span>
+    <span class="ctrl-badge" id="globalSpeedBadge" aria-hidden="true">1.00&times;</span>
   </div>
 
-  <button class="btn-bar" id="pauseAllBtn" title="Pause every video">&#10074;&#10074; Pause All</button>
-  <button class="btn-bar" id="muteAllBtn" title="Mute every video">&#128263; Mute All</button>
+  <button type="button" class="btn-bar" id="pauseAllBtn" title="Pause every video"><span aria-hidden="true">&#10074;&#10074;</span> Pause All</button>
+  <button type="button" class="btn-bar" id="muteAllBtn" title="Mute every video"><span aria-hidden="true">&#128263;</span> Mute All</button>
 
-  <label class="ctrl-toggle theme-toggle" id="themeToggleLabel" title="Toggle theme">
-    <input type="checkbox" id="themeToggle">
-    <span class="tog-track tog-theme"><span class="tog-thumb"></span></span>
-    <span class="ctrl-label" id="themeLabel">🌙 Night</span>
+  <label class="ctrl-toggle theme-toggle" id="themeToggleLabel" title="Switch between the Night and Moon themes">
+    <input type="checkbox" id="themeToggle" role="switch">
+    <span class="tog-track tog-theme" aria-hidden="true"><span class="tog-thumb"></span></span>
+    <span class="ctrl-label" id="themeLabel"><span aria-hidden="true" id="themeIcon">🌙</span> <span id="themeName">Night</span></span>
   </label>
 
-  <button class="btn-bar btn-notes" id="commonNotesBtn" title="Common Notes — a session-only scratchpad, separate from per-card notes">🗒 Common Notes</button>
+  <button type="button" class="btn-bar btn-notes" id="commonNotesBtn" title="Common Notes — a session-only scratchpad, separate from per-card notes" aria-haspopup="dialog"><span aria-hidden="true">🗒</span> Common Notes</button>
 
-  <button class="btn-help" id="helpBtn" title="Keyboard Shortcuts">⌨</button>
-  <div class="help-tooltip" id="helpTooltip">
+  <button type="button" class="btn-help" id="helpBtn" title="Keyboard shortcuts" aria-label="Keyboard shortcuts" aria-expanded="false" aria-controls="helpTooltip"><span aria-hidden="true">⌨</span></button>
+  <div class="help-tooltip" id="helpTooltip" role="region" aria-label="Keyboard shortcuts">
     <div class="help-row"><kbd>W</kbd><kbd>S</kbd> or <kbd>↑</kbd><kbd>↓</kbd><kbd>←</kbd><kbd>→</kbd> <span>Scroll</span></div>
     <div class="help-row"><kbd>Z</kbd> <span>Toggle Zoom (images &amp; videos)</span></div>
     <div class="help-row"><kbd>+</kbd><kbd>-</kbd> <span>Image Size</span></div>
     <div class="help-row"><kbd>F</kbd> <span>Fullscreen</span></div>
-    <div class="help-divider">Video (when hovering a video)</div>
+    <div class="help-divider">Video (when hovering or focused on a video)</div>
     <div class="help-row"><kbd>Space</kbd> <span>Play / Pause</span></div>
     <div class="help-row"><kbd>,</kbd> <kbd>.</kbd> <span>Prev / Next Frame</span></div>
     <div class="help-row"><kbd>J</kbd> <kbd>L</kbd> <span>Seek -5s / +5s</span></div>
     <div class="help-row"><kbd>M</kbd> <span>Mute</span></div>
-    <div class="help-row"><kbd>Click</kbd> <kbd>1×</kbd> <span>Cycle Playback Speed</span></div>
+    <div class="help-row"><kbd>Click</kbd> <kbd>1×</kbd> <span>Reset Playback Speed</span></div>
     <div class="help-divider">In Edit Mode</div>
     <div class="help-row"><kbd>Esc</kbd> <span>Exit Edit</span></div>
     <div class="help-row"><kbd>Ctrl</kbd><kbd>R</kbd> <span>Reset Edits</span></div>
+    <div class="help-divider">Everywhere</div>
+    <div class="help-row"><kbd>Esc</kbd> <span>Close this panel / dialogs</span></div>
   </div>
-</div>
+</header>
 
-<!-- EDIT PANEL — hidden by default, lazy-activated -->
-<div id="editPanel" class="edit-panel" aria-hidden="true">
-  <div class="ep-header">
-    <div class="ep-title">
-      <span class="ep-icon">✎</span>
-      <span>Edit Mode</span>
-    </div>
-    <button class="ep-close" id="epClose" title="Exit Edit Mode (Esc)">✕</button>
-  </div>
-
-  <div class="ep-body">
-    <div class="ep-section-label">Adjustments</div>
-
-    <div class="ep-control">
-      <div class="ep-ctrl-header">
-        <span class="ep-ctrl-name">Brightness</span>
-        <span class="ep-ctrl-val" id="epBrightnessVal">100%</span>
-      </div>
-      <input type="range" class="ep-slider" id="epBrightness" min="0" max="200" value="100" step="1">
-    </div>
-
-    <div class="ep-control">
-      <div class="ep-ctrl-header">
-        <span class="ep-ctrl-name">Contrast</span>
-        <span class="ep-ctrl-val" id="epContrastVal">100%</span>
-      </div>
-      <input type="range" class="ep-slider" id="epContrast" min="0" max="200" value="100" step="1">
-    </div>
-
-    <div class="ep-section-label ep-section-gap">Transform</div>
-
-    <div class="ep-rotate-row">
-      <button class="ep-rot-btn" id="epRotCCW" title="Rotate 90° counter-clockwise">↺ 90°</button>
-      <button class="ep-rot-btn" id="epRotCW"  title="Rotate 90° clockwise">↻ 90°</button>
-    </div>
-
-    <div class="ep-control">
-      <div class="ep-ctrl-header">
-        <span class="ep-ctrl-name">Free Rotate</span>
-        <span class="ep-ctrl-val" id="epRotateVal">0°</span>
-      </div>
-      <input type="range" class="ep-slider" id="epRotate" min="-180" max="180" value="0" step="1">
-    </div>
-
-    <div class="ep-actions">
-      <button class="ep-btn ep-btn-ghost" id="epReset" title="Ctrl+R">Reset</button>
-      <button class="ep-btn ep-btn-cancel" id="epCancel">Cancel</button>
-      <button class="ep-btn ep-btn-done" id="epDone">Done ✓</button>
-    </div>
-
-    <div class="ep-hint">Changes apply to this session only.<br>Exit edit mode to resume normal viewing.</div>
-  </div>
-</div>
-
-<!-- COMMON NOTES — session-only scratchpad, hidden by default until opened -->
-<div id="commonNotesOverlay" class="cn-overlay" aria-hidden="true">
-  <div class="cn-modal" role="dialog" aria-modal="true" aria-labelledby="cnTitle">
-    <div class="cn-header">
-      <div class="cn-title" id="cnTitle">
-        <span class="cn-icon">🗒</span>
-        <span>Common Notes</span>
-      </div>
-      <button class="cn-close" id="cnClose" title="Close (Esc)">✕</button>
-    </div>
-    <div class="cn-body">
-      <textarea id="cnTextarea" class="cn-textarea" placeholder="note down anything here… kept only for this session and cleared automatically on reload." spellcheck="true"></textarea>
-    </div>
-    <div class="cn-footer">
-      <span class="cn-hint">Session only — cleared automatically on reload.</span>
-      <button class="cn-clear" id="cnClearBtn" title="Delete all notes">Clear All</button>
-    </div>
-  </div>
-</div>
+<!-- The Edit panel and the Common Notes dialog are NOT in this file any more:
+     their markup and code are created on first use (chunks/edit-mode.js,
+     chunks/common-notes.js), so they cost nothing until someone opens them. -->
 
 <!-- SCROLLABLE PAGE BODY -->
-<div id="pageBody">
+<main id="pageBody" tabindex="-1">
 
-  <div id="inputbar">
-    <textarea id="bulkArea" placeholder="Paste image or video URLs (mp4, webm, mov) — one per line or comma-separated (up to 1,000). New load replaces previous set."></textarea>
+  <section id="inputbar" aria-label="Add media">
+    <label class="sr-only" for="bulkArea">Image or video links, one per line or comma-separated</label>
+    <textarea id="bulkArea" spellcheck="false" autocomplete="off" autocapitalize="off" autocorrect="off" aria-describedby="bulkHint" placeholder="Paste image or video URLs (mp4, webm, mov) — one per line or comma-separated (up to 1,000). New load replaces previous set."></textarea>
+    <p class="input-hint" id="bulkHint">Your browser fetches each link directly from its host; nothing is uploaded to Bat-Viewer. Only add links you have the right to view.</p>
     <div id="inputControls">
       <span class="bulk-tally" id="bulkTally"><b>0</b> URLs</span>
       <label class="append-toggle">
         <input type="checkbox" id="appendMode"><span>Append</span>
       </label>
-      <button class="btn btn-ghost" id="bulkClearBtn">Clear</button>
-      <button class="btn btn-gold" id="bulkLoadBtn">Load Media</button>
+      <button type="button" class="btn btn-ghost" id="bulkClearBtn">Clear</button>
+      <button type="button" class="btn btn-gold" id="bulkLoadBtn">Load Media</button>
     </div>
-    <div class="status hide" id="statusMsg"></div>
-    <div class="prog-wrap hide" id="progWrap">
+    <div class="status hide" id="statusMsg" role="status" aria-live="polite" aria-atomic="true"></div>
+    <div class="prog-wrap hide" id="progWrap" role="progressbar" aria-labelledby="progLabel" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
       <div class="prog-track"><div class="prog-fill" id="progFill"></div></div>
       <div class="prog-label" id="progLabel"></div>
     </div>
-  </div>
+  </section>
 
   <div id="gtoolbar">
-    <span class="gstats"><b id="gCount">0</b> items loaded</span>
-    <button class="btn btn-ghost" id="clearAllBtn">Clear All</button>
+    <span class="gstats"><b id="gCount">0</b> items loaded<span id="gShown"></span></span>
+    <button type="button" class="btn btn-ghost" id="clearAllBtn">Clear All</button>
   </div>
 
   <div class="gallery-wrap">
-    <div id="gallery"></div>
+    <div id="gallery" role="list" aria-label="Media gallery" tabindex="-1"></div>
+    <div id="gallerySentinel" aria-hidden="true"></div>
+    <div class="gallery-more" id="galleryMore" hidden>
+      <span id="galleryMoreText" role="status" aria-live="polite"></span>
+      <button type="button" class="btn btn-ghost" id="loadMoreBtn">Load more</button>
+      <button type="button" class="btn btn-ghost" id="loadAllBtn">Load all</button>
+    </div>
   </div>
 
-</div>
+</main>
 
-<button id="btt" aria-label="Back to top">&#8593;</button>
+<footer class="site-footer" id="siteFooter">
+  <p>Bat-Viewer is a free, non-commercial project run by <a href="https://github.com/aakashsharma-ux" rel="noopener noreferrer">aakashsharma-ux</a> on GitHub; use that profile to get in touch. It is an unofficial fan project and is not affiliated with, endorsed by or sponsored by DC or Warner Bros. Discovery. Batman and related marks belong to their owners.</p>
+  <nav aria-label="Legal and privacy">
+    <a href="privacy.html">Privacy policy</a>
+    <a href="terms.html">Terms of service</a>
+    <a href="cookies.html">Cookie policy</a>
+    <button type="button" class="link-btn" id="privacySettingsBtn">Privacy settings</button>
+    <button type="button" class="link-btn" id="deleteDataBtn">Delete my data</button>
+  </nav>
+</footer>
 
-<script src="app.js"></script>
+<button type="button" id="btt" aria-label="Back to top">&#8593;</button>
+
 </body>
 </html>
